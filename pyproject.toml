@@ -1,0 +1,111 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "liq-store"
+version = "0.1.0"
+description = "Storage abstraction layer for the LIQ Stack"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Travis Risner", email = "firestrand@gmail.com" },
+]
+keywords = [
+    "finance",
+    "trading",
+    "storage",
+    "parquet",
+    "time-series",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+    "Typing :: Typed",
+]
+dependencies = [
+    "liq-core>=0.1.0",
+    "polars>=1.20",
+    "pyarrow>=18.0",
+]
+
+[project.optional-dependencies]
+s3 = ["s3fs>=2024.10"]
+gcs = ["gcsfs>=2024.10"]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "hypothesis>=6.120",
+    "ruff>=0.14",
+    "mypy>=1.13",
+    "pre-commit>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/firestrand/liq-store"
+Repository = "https://github.com/firestrand/liq-store"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/liq"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q --cov=liq.store --cov-report=term-missing --cov-fail-under=90"
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["src/liq/store"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+    "raise NotImplementedError",
+    "\\.\\.\\.",  # Protocol method stubs
+    "pass",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["polars.*", "pyarrow.*", "s3fs.*", "gcsfs.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "ARG",    # flake8-unused-arguments
+    "SIM",    # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["liq"]
