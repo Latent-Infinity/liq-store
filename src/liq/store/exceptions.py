@@ -33,3 +33,34 @@ class DataCorruptionError(StorageError):
     """
 
     pass
+
+
+class ConcurrentWriteError(StorageError):
+    """Exception raised when concurrent write access is detected.
+
+    This occurs when attempting to acquire an exclusive lock on a
+    partition that is already locked by another writer.
+    """
+
+    pass
+
+
+class PathTraversalError(StorageError):
+    """Exception raised when a key attempts to traverse outside storage root.
+
+    This is a security exception raised when a storage key contains
+    path components (like '..') that would resolve to a path outside
+    the configured data_root directory.
+    """
+
+    pass
+
+
+class SchemaCompatibilityError(StorageError):
+    """Exception raised when append data has incompatible schema.
+
+    This occurs when attempting to append data with column types that
+    are incompatible with the existing data's schema.
+    """
+
+    pass

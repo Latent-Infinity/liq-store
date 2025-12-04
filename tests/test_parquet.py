@@ -1,13 +1,18 @@
 """Tests for liq.store.parquet module."""
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 import pytest
 
-from liq.store.exceptions import StorageError
-from liq.store.parquet import ParquetStore
+from liq.store.exceptions import (
+    ConcurrentWriteError,
+    PathTraversalError,
+    SchemaCompatibilityError,
+    StorageError,
+)
+from liq.store.parquet import ParquetStore, ParquetStoreConfig
 
 
 class TestParquetStoreCreation:
@@ -26,6 +31,308 @@ class TestParquetStoreCreation:
         assert hasattr(store, "delete")
         assert hasattr(store, "list_keys")
         assert hasattr(store, "get_date_range")
+
+    def test_default_config(self, temp_storage_path: Path) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        assert store.config.target_rows_per_file == 150_000
+        assert store.config.compression == "zstd"
+        assert store.config.compression_level == 3
+        assert store.config.lock_timeout_seconds == 30
+
+    def test_custom_config(self, temp_storage_path: Path) -> None:
+        config = ParquetStoreConfig(
+            target_rows_per_file=100_000,
+            compression="snappy",
+            compression_level=5,
+            lock_timeout_seconds=60,
+        )
+        store = ParquetStore(str(temp_storage_path), config=config)
+        assert store.config.target_rows_per_file == 100_000
+        assert store.config.compression == "snappy"
+        assert store.config.compression_level == 5
+        assert store.config.lock_timeout_seconds == 60
+
+
+class TestParquetStoreConfig:
+    """Tests for ParquetStoreConfig."""
+
+    def test_default_values(self) -> None:
+        config = ParquetStoreConfig()
+        assert config.target_rows_per_file == 150_000
+        assert config.compression == "zstd"
+        assert config.compression_level == 3
+        assert config.lock_timeout_seconds == 30
+
+    def test_custom_values(self) -> None:
+        config = ParquetStoreConfig(
+            target_rows_per_file=50_000,
+            compression="lz4",
+            compression_level=10,
+            lock_timeout_seconds=120,
+        )
+        assert config.target_rows_per_file == 50_000
+        assert config.compression == "lz4"
+        assert config.compression_level == 10
+        assert config.lock_timeout_seconds == 120
+
+    def test_config_is_frozen(self) -> None:
+        from dataclasses import FrozenInstanceError
+
+        config = ParquetStoreConfig()
+        with pytest.raises(FrozenInstanceError):
+            config.target_rows_per_file = 999  # type: ignore[misc]
+
+
+class TestPathTraversal:
+    """Tests for path traversal protection."""
+
+    def test_rejects_dotdot_traversal(self, temp_storage_path: Path) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        df = pl.DataFrame({"value": [1.0]})
+
+        with pytest.raises(PathTraversalError, match="traverses outside storage root"):
+            store.write("../escape", df)
+
+    def test_rejects_complex_traversal(self, temp_storage_path: Path) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        df = pl.DataFrame({"value": [1.0]})
+
+        with pytest.raises(PathTraversalError, match="traverses outside storage root"):
+            store.write("foo/../../escape", df)
+
+    def test_rejects_absolute_path(self, temp_storage_path: Path) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        df = pl.DataFrame({"value": [1.0]})
+
+        with pytest.raises(PathTraversalError, match="traverses outside storage root"):
+            store.write("/etc/passwd", df)
+
+    def test_read_rejects_path_traversal(self, temp_storage_path: Path) -> None:
+        store = ParquetStore(str(temp_storage_path))
+
+        with pytest.raises(PathTraversalError):
+            store.read("../escape")
+
+    def test_exists_rejects_path_traversal(self, temp_storage_path: Path) -> None:
+        store = ParquetStore(str(temp_storage_path))
+
+        with pytest.raises(PathTraversalError):
+            store.exists("../escape")
+
+    def test_delete_rejects_path_traversal(self, temp_storage_path: Path) -> None:
+        store = ParquetStore(str(temp_storage_path))
+
+        with pytest.raises(PathTraversalError):
+            store.delete("../escape")
+
+    def test_get_date_range_rejects_path_traversal(
+        self, temp_storage_path: Path
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+
+        with pytest.raises(PathTraversalError):
+            store.get_date_range("../escape")
+
+    def test_valid_nested_key_allowed(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        # Valid nested keys should work fine
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+        assert store.exists("forex/EUR_USD")
+
+
+class TestSchemaCompatibility:
+    """Tests for schema compatibility checking on append."""
+
+    def test_append_compatible_schema_succeeds(
+        self, temp_storage_path: Path, sample_timestamp: datetime
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+
+        df1 = pl.DataFrame({
+            "timestamp": [sample_timestamp],
+            "value": [1.0],
+        })
+        df2 = pl.DataFrame({
+            "timestamp": [sample_timestamp + timedelta(minutes=1)],
+            "value": [2.0],
+        })
+
+        store.write("test/key", df1)
+        store.write("test/key", df2, mode="append")
+
+        result = store.read("test/key")
+        assert len(result) == 2
+
+    def test_append_new_columns_succeeds(
+        self, temp_storage_path: Path, sample_timestamp: datetime
+    ) -> None:
+        """Schema evolution: adding new columns should work."""
+        store = ParquetStore(str(temp_storage_path))
+
+        df1 = pl.DataFrame({
+            "timestamp": [sample_timestamp],
+            "value": [1.0],
+        })
+        df2 = pl.DataFrame({
+            "timestamp": [sample_timestamp + timedelta(minutes=1)],
+            "value": [2.0],
+            "new_column": ["extra"],  # New column
+        })
+
+        store.write("test/key", df1)
+        store.write("test/key", df2, mode="append")
+
+        result = store.read("test/key")
+        assert len(result) == 2
+        assert "new_column" in result.columns
+
+    def test_append_incompatible_types_raises_error(
+        self, temp_storage_path: Path, sample_timestamp: datetime
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+
+        df1 = pl.DataFrame({
+            "timestamp": [sample_timestamp],
+            "value": [1.0],  # Float
+        })
+        df2 = pl.DataFrame({
+            "timestamp": [sample_timestamp + timedelta(minutes=1)],
+            "value": ["string"],  # String - incompatible!
+        })
+
+        store.write("test/key", df1)
+
+        with pytest.raises(SchemaCompatibilityError, match="Schema incompatible"):
+            store.write("test/key", df2, mode="append")
+
+    def test_append_numeric_widening_allowed(
+        self, temp_storage_path: Path, sample_timestamp: datetime
+    ) -> None:
+        """Numeric type widening (Int32 -> Int64) should be allowed."""
+        store = ParquetStore(str(temp_storage_path))
+
+        df1 = pl.DataFrame({
+            "timestamp": [sample_timestamp],
+            "value": pl.Series([1], dtype=pl.Int32),
+        })
+        df2 = pl.DataFrame({
+            "timestamp": [sample_timestamp + timedelta(minutes=1)],
+            "value": pl.Series([2], dtype=pl.Int64),
+        })
+
+        store.write("test/key", df1)
+        store.write("test/key", df2, mode="append")
+
+        result = store.read("test/key")
+        assert len(result) == 2
+
+
+class TestConcurrentWrites:
+    """Tests for concurrent write protection."""
+
+    def test_concurrent_write_raises_error(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Test that concurrent writes to same partition raise ConcurrentWriteError."""
+        store = ParquetStore(str(temp_storage_path))
+
+        # First, create the partition so locks are needed
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+
+        # We need to test the locking mechanism by trying to acquire lock twice
+        key_path = store._key_to_path("forex/EUR_USD")
+
+        # Manually acquire lock
+        from liq.store.parquet import FcntlPartitionLock
+
+        lock1 = FcntlPartitionLock(key_path)
+        lock1.acquire()
+
+        try:
+            # Second lock should fail
+            lock2 = FcntlPartitionLock(key_path)
+            with pytest.raises(ConcurrentWriteError, match="locked by another writer"):
+                lock2.acquire()
+        finally:
+            lock1.release()
+
+    def test_lock_released_after_write(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Test that lock is released after write completes."""
+        store = ParquetStore(str(temp_storage_path))
+
+        # Write should acquire and release lock
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+
+        # Second write should succeed (lock released)
+        store.write("forex/EUR_USD", sample_ohlcv_df, mode="append")
+
+    def test_lock_released_on_error(self, temp_storage_path: Path) -> None:
+        """Test that lock is released even when write fails."""
+        store = ParquetStore(str(temp_storage_path))
+
+        # Create a situation that will cause write to fail
+        key_path = temp_storage_path / "blocked"
+        key_path.write_text("blocking file")
+
+        df = pl.DataFrame({"value": [1.0]})
+
+        with pytest.raises(StorageError):
+            store.write("blocked/key", df)
+
+        # Lock should be released, so we should be able to write elsewhere
+        store.write("other/key", df)
+
+
+class TestAtomicWrites:
+    """Tests for atomic write behavior."""
+
+    def test_temp_cleaned_on_failure(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Test that temp directory is cleaned up on write failure."""
+        store = ParquetStore(str(temp_storage_path))
+
+        # First write to create partition
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+
+        # Create incompatible data that will fail schema check
+        bad_df = pl.DataFrame({
+            "timestamp": [datetime.now(UTC)],
+            "symbol": [123],  # Wrong type - was string before
+        })
+
+        with pytest.raises(SchemaCompatibilityError):
+            store.write("forex/EUR_USD", bad_df, mode="append")
+
+        # No temp directories should remain
+        temp_dirs = list(temp_storage_path.glob("**/.*.tmp.*"))
+        assert len(temp_dirs) == 0
+
+    def test_original_preserved_on_failure(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        """Test that original data is preserved when write fails."""
+        store = ParquetStore(str(temp_storage_path))
+
+        # First write
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+        original_count = len(store.read("forex/EUR_USD"))
+
+        # Incompatible append should fail
+        bad_df = pl.DataFrame({
+            "timestamp": [datetime.now(UTC)],
+            "open": ["not_a_number"],  # Wrong type
+        })
+
+        with pytest.raises(SchemaCompatibilityError):
+            store.write("forex/EUR_USD", bad_df, mode="append")
+
+        # Original data should be unchanged
+        assert len(store.read("forex/EUR_USD")) == original_count
 
 
 class TestParquetStoreWrite:
@@ -94,7 +401,9 @@ class TestParquetStoreWrite:
         # Should create data.parquet file
         assert (temp_storage_path / "test" / "no_timestamp" / "data.parquet").exists()
 
-    def test_write_append_without_timestamp_column(self, temp_storage_path: Path) -> None:
+    def test_write_append_without_timestamp_column(
+        self, temp_storage_path: Path
+    ) -> None:
         store = ParquetStore(str(temp_storage_path))
         df1 = pl.DataFrame({"symbol": ["EUR_USD"], "value": [1.0]})
         df2 = pl.DataFrame({"symbol": ["GBP_USD"], "value": [2.0]})
@@ -215,6 +524,49 @@ class TestParquetStoreRead:
         result = store.read("test/no_ts", start=date(2024, 1, 1), end=date(2024, 1, 31))
         assert len(result) == 2
 
+    def test_read_with_columns_subset(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+
+        result = store.read("forex/EUR_USD", columns=["timestamp", "close"])
+        assert set(result.columns) == {"timestamp", "close"}
+
+    def test_read_streaming_mode(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+
+        result = store.read("forex/EUR_USD", streaming=True)
+        assert isinstance(result, pl.DataFrame)
+        assert len(result) == len(sample_ohlcv_df)
+
+    def test_read_batch_mode_returns_iterator(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+
+        result = store.read("forex/EUR_USD", batch_size=1)
+        # Should return an iterator
+        batches = list(result)
+        assert len(batches) == 3  # 3 rows, batch_size=1
+
+    def test_read_batch_iteration_complete(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+
+        # Read in batches and verify all data is returned
+        total_rows = 0
+        for batch in store.read("forex/EUR_USD", batch_size=2):
+            total_rows += len(batch)
+
+        assert total_rows == len(sample_ohlcv_df)
+
 
 class TestParquetStoreExists:
     """Tests for ParquetStore.exists method."""
@@ -234,7 +586,9 @@ class TestParquetStoreExists:
 class TestParquetStoreDelete:
     """Tests for ParquetStore.delete method."""
 
-    def test_delete_returns_false_for_nonexistent(self, temp_storage_path: Path) -> None:
+    def test_delete_returns_false_for_nonexistent(
+        self, temp_storage_path: Path
+    ) -> None:
         store = ParquetStore(str(temp_storage_path))
         result = store.delete("nonexistent/key")
         assert result is False
@@ -287,6 +641,23 @@ class TestParquetStoreDelete:
         # Parent forex directory should still exist (sibling data present)
         assert (temp_storage_path / "forex").exists()
         assert store.exists("forex/GBP_USD")
+
+    def test_delete_removes_lock_file_if_present(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+
+        # Manually create a lock file to test cleanup
+        # (Lock is released after write, but file may persist on some systems)
+        key_path = temp_storage_path / "forex" / "EUR_USD"
+        lock_file = key_path / ".lock"
+        lock_file.touch()  # Create lock file
+        assert lock_file.exists()
+
+        store.delete("forex/EUR_USD")
+        # Lock file should be removed along with data
+        assert not lock_file.exists()
 
 
 class TestParquetStoreListKeys:
@@ -392,3 +763,31 @@ class TestParquetStoreGetDateRange:
         start, end = result
         assert start == sample_timestamp.date()
         assert end == (sample_timestamp + timedelta(days=10)).date()
+
+
+class TestLogging:
+    """Tests for logging behavior."""
+
+    def test_write_logs_on_success(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            store = ParquetStore(str(temp_storage_path))
+            store.write("forex/EUR_USD", sample_ohlcv_df)
+
+        assert any("Wrote" in record.message and "forex/EUR_USD" in record.message for record in caplog.records)
+
+    def test_read_logs_debug_info(
+        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        store = ParquetStore(str(temp_storage_path))
+        store.write("forex/EUR_USD", sample_ohlcv_df)
+
+        with caplog.at_level(logging.DEBUG):
+            store.read("forex/EUR_USD")
+
+        assert any("Reading" in record.message for record in caplog.records)

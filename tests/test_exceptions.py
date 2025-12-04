@@ -2,7 +2,14 @@
 
 import pytest
 
-from liq.store.exceptions import DataCorruptionError, DataNotFoundError, StorageError
+from liq.store.exceptions import (
+    ConcurrentWriteError,
+    DataCorruptionError,
+    DataNotFoundError,
+    PathTraversalError,
+    SchemaCompatibilityError,
+    StorageError,
+)
 
 
 class TestStorageError:
@@ -51,3 +58,51 @@ class TestDataCorruptionError:
     def test_can_catch_specifically(self) -> None:
         with pytest.raises(DataCorruptionError):
             raise DataCorruptionError("data corrupted")
+
+
+class TestConcurrentWriteError:
+    """Tests for ConcurrentWriteError exception."""
+
+    def test_inherits_from_storage_error(self) -> None:
+        error = ConcurrentWriteError("locked")
+        assert isinstance(error, StorageError)
+
+    def test_can_catch_as_storage_error(self) -> None:
+        with pytest.raises(StorageError):
+            raise ConcurrentWriteError("partition locked")
+
+    def test_can_catch_specifically(self) -> None:
+        with pytest.raises(ConcurrentWriteError):
+            raise ConcurrentWriteError("partition locked")
+
+
+class TestPathTraversalError:
+    """Tests for PathTraversalError exception."""
+
+    def test_inherits_from_storage_error(self) -> None:
+        error = PathTraversalError("traversal detected")
+        assert isinstance(error, StorageError)
+
+    def test_can_catch_as_storage_error(self) -> None:
+        with pytest.raises(StorageError):
+            raise PathTraversalError("path traversal")
+
+    def test_can_catch_specifically(self) -> None:
+        with pytest.raises(PathTraversalError):
+            raise PathTraversalError("path traversal")
+
+
+class TestSchemaCompatibilityError:
+    """Tests for SchemaCompatibilityError exception."""
+
+    def test_inherits_from_storage_error(self) -> None:
+        error = SchemaCompatibilityError("schema mismatch")
+        assert isinstance(error, StorageError)
+
+    def test_can_catch_as_storage_error(self) -> None:
+        with pytest.raises(StorageError):
+            raise SchemaCompatibilityError("incompatible schema")
+
+    def test_can_catch_specifically(self) -> None:
+        with pytest.raises(SchemaCompatibilityError):
+            raise SchemaCompatibilityError("incompatible schema")
