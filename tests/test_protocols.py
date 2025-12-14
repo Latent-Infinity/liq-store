@@ -41,6 +41,10 @@ class TestTimeSeriesStoreProtocol:
         """Protocol should define get_date_range method."""
         assert hasattr(TimeSeriesStore, "get_date_range")
 
+    def test_protocol_defines_read_latest(self) -> None:
+        """Protocol should define read_latest method."""
+        assert hasattr(TimeSeriesStore, "read_latest")
+
 
 class MockTimeSeriesStore:
     """Mock implementation for testing protocol conformance."""
@@ -85,6 +89,15 @@ class MockTimeSeriesStore:
         if min_ts is None or max_ts is None:
             return None
         return (min_ts.date(), max_ts.date())
+
+    def read_latest(self, key: str, n: int = 1) -> pl.DataFrame:
+        if key not in self._data:
+            return pl.DataFrame()
+        df = self._data[key]
+        if "timestamp" not in df.columns or df.is_empty():
+            return pl.DataFrame()
+        df_sorted = df.sort("timestamp")
+        return df_sorted.tail(n)
 
 
 class TestMockTimeSeriesStore:
@@ -155,6 +168,13 @@ class TestMockTimeSeriesStore:
         store = MockTimeSeriesStore()
         result = store.read("nonexistent")
         assert len(result) == 0
+
+    def test_read_latest(self, sample_ohlcv_df: pl.DataFrame) -> None:
+        store = MockTimeSeriesStore()
+        store.write("test/EUR_USD", sample_ohlcv_df)
+        latest = store.read_latest("test/EUR_USD", n=1)
+        assert len(latest) == 1
+        assert latest["timestamp"][0] == sample_ohlcv_df["timestamp"].max()
 
     def test_write_append_mode(self, sample_ohlcv_df: pl.DataFrame) -> None:
         store = MockTimeSeriesStore()

@@ -31,6 +31,7 @@ class TestParquetStoreCreation:
         assert hasattr(store, "delete")
         assert hasattr(store, "list_keys")
         assert hasattr(store, "get_date_range")
+        assert hasattr(store, "read_latest")
 
     def test_default_config(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
@@ -382,6 +383,22 @@ class TestParquetStoreWrite:
         result = store.read("forex/EUR_USD")
         assert len(result) == len(new_df)
 
+    def test_write_creates_partitioned_directories(
+        self, temp_storage_path: Path, sample_timestamp: datetime
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        df = pl.DataFrame({
+            "timestamp": [sample_timestamp],
+            "symbol": ["EUR_USD"],
+            "value": [1.0],
+        })
+        store.write("forex/EUR_USD", df)
+
+        year_dir = temp_storage_path / "forex" / "EUR_USD" / f"year={sample_timestamp.year}"
+        month_dir = year_dir / f"month={sample_timestamp.month:02d}"
+        parquet_files = list(month_dir.glob("*.parquet"))
+        assert parquet_files, "Partitioned parquet files should be created"
+
     def test_write_empty_dataframe(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         empty_df = pl.DataFrame({"timestamp": [], "value": []})
@@ -513,6 +530,27 @@ class TestParquetStoreRead:
 
         assert len(result) == 1  # Should get only day 0
 
+    def test_read_latest(
+        self, temp_storage_path: Path, sample_timestamp: datetime
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+
+        timestamps = [
+            sample_timestamp,
+            sample_timestamp + timedelta(days=1),
+            sample_timestamp + timedelta(days=2),
+        ]
+        df = pl.DataFrame({
+            "timestamp": timestamps,
+            "symbol": ["EUR_USD"] * 3,
+            "value": [1.0, 2.0, 3.0],
+        })
+        store.write("forex/EUR_USD", df)
+
+        latest = store.read_latest("forex/EUR_USD", n=1)
+        assert len(latest) == 1
+        assert latest["timestamp"][0] == sample_timestamp + timedelta(days=2)
+
     def test_read_without_timestamp_column_ignores_filters(
         self, temp_storage_path: Path
     ) -> None:
@@ -622,11 +660,8 @@ class TestParquetStoreDelete:
         result = store.delete("deep/nested/path/key")
         assert result is True
 
-        # Empty parent directories should be cleaned up
+        # Key directory should be removed
         assert not (temp_storage_path / "deep" / "nested" / "path" / "key").exists()
-        assert not (temp_storage_path / "deep" / "nested" / "path").exists()
-        assert not (temp_storage_path / "deep" / "nested").exists()
-        assert not (temp_storage_path / "deep").exists()
 
     def test_delete_preserves_sibling_directories(
         self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame

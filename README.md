@@ -1,6 +1,6 @@
 # liq-store
 
-Storage abstraction layer for the LIQ (Latent Infinity Quant) Stack. Provides backend-agnostic storage for time-series financial data using Parquet with ZSTD compression.
+Storage abstraction layer for the LIQ (Latent Infinity Quant) Stack. Provides backend-agnostic storage for time-series and related tabular data using Parquet with ZSTD compression.
 
 ## Features
 
@@ -11,6 +11,7 @@ Storage abstraction layer for the LIQ (Latent Infinity Quant) Stack. Provides ba
 - **Schema Validation**: Type compatibility checked on append to prevent silent corruption
 - **Configurable Compression**: ZSTD compression with tunable levels
 - **Memory-Efficient Reading**: Optional streaming and batch modes for large datasets
+- **Standardized Keys**: Helper builders for bars/features/indicators/fundamentals so every producer shares the same layout
 
 ## Installation
 
@@ -34,7 +35,7 @@ from decimal import Decimal
 
 import polars as pl
 
-from liq.store import ParquetStore
+from liq.store import ParquetStore, key_builder
 
 # Initialize store
 store = ParquetStore("./data")
@@ -54,18 +55,18 @@ df = pl.DataFrame({
     "volume": [1000, 1500, 1200],
 })
 
-# Write data
-store.write("forex/EUR_USD", df)
+# Write data (provider-prefixed + standardized bars key)
+store.write(f"oanda/{key_builder.bars('EUR_USD', '1m')}", df)
 
 # Read data back
-result = store.read("forex/EUR_USD")
+result = store.read(f"oanda/{key_builder.bars('EUR_USD', '1m')}")
 print(result)
 ```
 
 ### Append Mode
 
 ```python
-# Append new data (automatically deduplicates by timestamp)
+# Append new data (automatically deduplicates by timestamp/symbol/provider when present)
 new_data = pl.DataFrame({
     "timestamp": [datetime(2024, 1, 1, 10, 3, tzinfo=UTC)],
     "symbol": ["EUR_USD"],
@@ -76,7 +77,7 @@ new_data = pl.DataFrame({
     "volume": [1100],
 })
 
-store.write("forex/EUR_USD", new_data, mode="append")
+store.write(f"oanda/{key_builder.bars('EUR_USD', '1m')}", new_data, mode="append")
 ```
 
 ### Date Filtering
@@ -86,7 +87,7 @@ from datetime import date
 
 # Read specific date range
 df = store.read(
-    "forex/EUR_USD",
+    f"oanda/{key_builder.bars('EUR_USD', '1m')}",
     start=date(2024, 1, 1),
     end=date(2024, 1, 31),
 )
@@ -96,13 +97,13 @@ df = store.read(
 
 ```python
 # Column subset (reduces memory)
-df = store.read("forex/EUR_USD", columns=["timestamp", "close"])
+df = store.read(f"oanda/{key_builder.bars('EUR_USD', '1m')}", columns=["timestamp", "close"])
 
 # Streaming mode (memory-efficient for large datasets)
-df = store.read("forex/EUR_USD", streaming=True)
+df = store.read(f"oanda/{key_builder.bars('EUR_USD', '1m')}", streaming=True)
 
 # Batch processing (very large datasets)
-for batch in store.read("forex/EUR_USD", batch_size=100_000):
+for batch in store.read(f"oanda/{key_builder.bars('EUR_USD', '1m')}", batch_size=100_000):
     process(batch)
 ```
 
@@ -126,25 +127,25 @@ store = ParquetStore("./data", config=config)
 
 ```python
 # Check if data exists
-if store.exists("forex/EUR_USD"):
+if store.exists(f"oanda/{key_builder.bars('EUR_USD', '1m')}"):
     print("Data available")
 
 # Get date range of available data
-date_range = store.get_date_range("forex/EUR_USD")
+date_range = store.get_date_range(f"oanda/{key_builder.bars('EUR_USD', '1m')}")
 if date_range:
     start, end = date_range
     print(f"Data from {start} to {end}")
 
 # List all keys
 keys = store.list_keys()
-print(keys)  # ['crypto/BTC-USD', 'forex/EUR_USD', 'forex/GBP_USD']
+print(keys)  # ['oanda/EUR_USD/bars/1m', 'binance/BTC_USDT/bars/1h']
 
 # List keys with prefix filter
-forex_keys = store.list_keys(prefix="forex/")
-print(forex_keys)  # ['forex/EUR_USD', 'forex/GBP_USD']
+oanda_keys = store.list_keys(prefix="oanda/")
+print(oanda_keys)  # ['oanda/EUR_USD/bars/1m']
 
 # Delete data
-store.delete("forex/EUR_USD")
+store.delete(f"oanda/{key_builder.bars('EUR_USD', '1m')}")
 ```
 
 ## Storage Layout
@@ -153,18 +154,29 @@ Data is stored in a hierarchical directory structure:
 
 ```
 data_root/
-    forex/
+    oanda/
         EUR_USD/
-            20240101T100000-20240101T235959.parquet
-            20240102T000000-20240102T235959.parquet
-        GBP_USD/
-            20240101T100000-20240101T235959.parquet
-    crypto/
-        BTC-USD/
-            20240101T000000-20240101T235959.parquet
+            bars/
+                1m/
+                    year=2024/month=01/20240101T100000-20240101T235959.parquet
+                    year=2024/month=02/20240201T000000-20240201T235959.parquet
+            features/
+                alpha_v1/data.parquet
+            fundamentals/data.parquet
 ```
 
-Filenames encode the timestamp range of contained data in ISO 8601 compact format.
+Filenames encode the timestamp range of contained data in ISO 8601 compact format. Timestamped data is partitioned by year/month; non-timestamp data stays unpartitioned in `data.parquet` chunks under the key directory. Empty writes are ignored to avoid clutter.
+
+### Key schema helpers
+
+Use the helpers in `liq.store.key_builder` to stay consistent across services:
+
+- `key_builder.bars(symbol, timeframe)` → `"EUR_USD/bars/1m"`
+- `key_builder.features(symbol, feature_set)` → `"EUR_USD/features/alpha_v1"`
+- `key_builder.indicators(symbol, indicator, params_id)` → `"EUR_USD/indicators/rsi/14"`
+- `key_builder.fundamentals(symbol)` → `"EUR_USD/fundamentals"`
+
+Keys are typically prefixed by provider (e.g., `oanda/{bars_key}`).
 
 ## Exception Handling
 
@@ -175,12 +187,13 @@ from liq.store import (
     PathTraversalError,
     ConcurrentWriteError,
     SchemaCompatibilityError,
+    key_builder,
 )
 
 store = ParquetStore("./data")
 
 try:
-    store.write("forex/EUR_USD", df)
+    store.write(f"oanda/{key_builder.bars('EUR_USD', '1m')}", df)
 except PathTraversalError:
     # Key attempted to escape data root (e.g., "../secrets")
     print("Invalid key: path traversal detected")

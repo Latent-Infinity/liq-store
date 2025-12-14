@@ -72,6 +72,22 @@ class TimeSeriesStore(Protocol):
         """
         ...
 
+    def read_latest(self, key: str, n: int = 1) -> pl.DataFrame:
+        """Read the most recent rows for a key.
+
+        Args:
+            key: Storage key
+            n: Number of most recent rows to return (default: 1)
+
+        Returns:
+            Polars DataFrame with the most recent n rows (sorted ascending by timestamp)
+
+        Raises:
+            StorageError: If read operation fails
+            DataCorruptionError: If stored data is corrupted
+        """
+        ...
+
     def exists(self, key: str) -> bool:
         """Check if data exists for a key.
 

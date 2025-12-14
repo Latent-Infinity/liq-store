@@ -38,7 +38,7 @@ from liq.store.exceptions import (
     SchemaCompatibilityError,
     StorageError,
 )
-from liq.store.naming import generate_filename
+from liq.store.naming import generate_filename, parse_filename
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -108,15 +108,18 @@ class FcntlPartitionLock:
             ConcurrentWriteError: If lock cannot be acquired (another writer holds it)
         """
         self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(str(self.lock_file), os.O_WRONLY | os.O_CREAT)
+        fd = os.open(str(self.lock_file), os.O_WRONLY | os.O_CREAT)
         try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as e:
-            os.close(self._fd)
-            self._fd = None
+            os.close(fd)
             raise ConcurrentWriteError(
                 "Failed to acquire lock: partition is locked by another writer"
             ) from e
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
 
     def release(self) -> None:
         """Release the partition lock."""
@@ -285,11 +288,18 @@ class ParquetStore:
         # This allows type coercion (e.g., Int32 -> Int64) and missing columns become null
         combined = pl.concat([existing, new], how="diagonal_relaxed")
 
-        # Deduplicate by timestamp if present
+        subset: list[str] = []
         if "timestamp" in combined.columns:
-            combined = combined.unique(subset=["timestamp"], keep="last").sort(
-                "timestamp"
-            )
+            subset.append("timestamp")
+        if "symbol" in combined.columns:
+            subset.append("symbol")
+        if "provider" in combined.columns:
+            subset.append("provider")
+
+        if subset:
+            combined = combined.unique(subset=subset, keep="last")
+            if "timestamp" in combined.columns:
+                combined = combined.sort("timestamp")
 
         return combined
 
@@ -315,40 +325,117 @@ class ParquetStore:
             with self._partition_lock(key_path):
                 temp_path = key_path.parent / f".{key_path.name}.tmp.{uuid4().hex[:8]}"
 
+                write_succeeded = False
                 try:
                     temp_path.mkdir(parents=True, exist_ok=True)
 
-                    if mode == "overwrite" or not key_path.exists():
-                        # Fresh write
-                        output_df = data
-                        if "timestamp" in output_df.columns:
-                            output_df = output_df.sort("timestamp")
-                    elif mode == "append" and any(key_path.glob("*.parquet")):
-                        # Read, check schema, merge, dedupe
-                        existing_df = pl.read_parquet(key_path / "*.parquet")
-                        self._check_schema_compatibility(existing_df.schema, data.schema)
-                        output_df = self._merge_and_dedupe(existing_df, data)
+                    if data.is_empty():
+                        logger.info("No data to write for key=%s (empty DataFrame)", key)
+                        return
+
+                    # Global schema check against any existing file for append mode
+                    if mode == "append" and key_path.exists():
+                        first_existing = next(key_path.rglob("*.parquet"), None)
+                        if first_existing:
+                            existing_df = pl.read_parquet(first_existing)
+                            self._check_schema_compatibility(
+                                existing_df.schema, data.schema
+                            )
+
+                    # Determine partitions from data
+                    if "timestamp" in data.columns:
+                        data_with_parts = data.with_columns(
+                            [
+                                pl.col("timestamp").dt.year().alias("_year"),
+                                pl.col("timestamp").dt.month().alias("_month"),
+                            ]
+                        )
+                        partitions = data_with_parts.partition_by(
+                            ["_year", "_month"], maintain_order=True
+                        )
                     else:
-                        # No existing data, treat as fresh write
-                        output_df = data
-                        if "timestamp" in output_df.columns:
-                            output_df = output_df.sort("timestamp")
+                        partitions = [data]
 
-                    # Write to temp location
-                    self._write_chunked(output_df, temp_path)
+                    touched_partitions: set[tuple[int | None, int | None]] = set()
+                    if "timestamp" in data.columns:
+                        for part in partitions:
+                            year = int(part["_year"][0])
+                            month = int(part["_month"][0])
+                            touched_partitions.add((year, month))
+                    else:
+                        touched_partitions.add((None, None))
 
-                    # Atomic swap - readers see old OR new, never partial
+                    # Copy untouched existing partitions for append
+                    if mode == "append" and key_path.exists():
+                        if "timestamp" in data.columns:
+                            for year_dir in key_path.glob("year=*"):
+                                year_value = year_dir.name.replace("year=", "")
+                                for month_dir in year_dir.glob("month=*"):
+                                    month_value = month_dir.name.replace("month=", "")
+                                    try:
+                                        year_int = int(year_value)
+                                        month_int = int(month_value)
+                                    except ValueError:
+                                        continue
+                                    if (year_int, month_int) in touched_partitions:
+                                        continue
+                                    dest_dir = (
+                                        temp_path / year_dir.name / month_dir.name
+                                    )
+                                    dest_dir.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.copytree(month_dir, dest_dir)
+                        else:
+                            # No timestamp partitioning; copy everything
+                            shutil.copytree(key_path, temp_path, dirs_exist_ok=True)
+
+                    # Handle touched partitions
+                    if "timestamp" in data.columns:
+                        for part in partitions:
+                            year = int(part["_year"][0])
+                            month = int(part["_month"][0])
+                            part_df = part.drop(["_year", "_month"])
+                            part_dest = temp_path / f"year={year}" / f"month={month:02d}"
+                            existing_df = pl.DataFrame()
+                            existing_path = (
+                                key_path / f"year={year}" / f"month={month:02d}"
+                            )
+                            if mode != "overwrite" and existing_path.exists() and any(
+                                existing_path.glob("*.parquet")
+                            ):
+                                existing_df = pl.read_parquet(
+                                    existing_path / "*.parquet"
+                                )
+                                self._check_schema_compatibility(
+                                    existing_df.schema, part_df.schema
+                                )
+                            merged = self._merge_and_dedupe(existing_df, part_df)
+                            if "timestamp" in merged.columns:
+                                merged = merged.sort("timestamp")
+                            self._write_chunked(merged, part_dest)
+                    else:
+                        # No timestamp partitioning; treat as single partition
+                        existing_df = pl.DataFrame()
+                        if mode == "append" and key_path.exists():
+                            existing_glob = list(key_path.glob("*.parquet"))
+                            if existing_glob:
+                                existing_df = pl.read_parquet(existing_glob)
+                                self._check_schema_compatibility(
+                                    existing_df.schema, data.schema
+                                )
+                        merged = self._merge_and_dedupe(existing_df, data)
+                        self._write_chunked(merged, temp_path)
+
+                    # Atomic swap
                     if key_path.exists():
                         shutil.rmtree(key_path)
                     temp_path.rename(key_path)
 
-                    logger.info("Wrote %d rows to %s", len(output_df), key)
+                    logger.info("Wrote %d rows to %s", len(data), key)
+                    write_succeeded = True
 
-                except Exception:
-                    # Clean up temp on any error
-                    if temp_path.exists():
+                finally:
+                    if not write_succeeded and temp_path.exists():
                         shutil.rmtree(temp_path)
-                    raise
 
         except (PathTraversalError, ConcurrentWriteError, SchemaCompatibilityError):
             # Re-raise our own exceptions without wrapping
@@ -369,6 +456,8 @@ class ParquetStore:
         """
         if df.is_empty():
             return
+
+        path.mkdir(parents=True, exist_ok=True)
 
         # If no timestamp column, write as single file
         if "timestamp" not in df.columns:
@@ -452,13 +541,13 @@ class ParquetStore:
                 logger.debug("Key %s does not exist, returning empty DataFrame", key)
                 return pl.DataFrame()
 
-            parquet_files = list(key_path.glob("*.parquet"))
+            parquet_files = sorted(key_path.rglob("*.parquet"))
             if not parquet_files:
                 logger.debug("No parquet files for %s, returning empty DataFrame", key)
                 return pl.DataFrame()
 
             # Use lazy scanning for memory efficiency
-            lf = pl.scan_parquet(key_path / "*.parquet")
+            lf = pl.scan_parquet(parquet_files)
 
             # Apply column selection (predicate pushdown)
             if columns:
@@ -492,6 +581,57 @@ class ParquetStore:
         except pl.exceptions.PolarsError as e:
             logger.error("Failed to read from %s: %s", key, e)
             raise StorageError(f"Failed to read data: {e}") from e
+
+    def read_latest(self, key: str, n: int = 1) -> pl.DataFrame:
+        """Read the most recent rows for a key."""
+        df = self.read(key)
+        if df.is_empty() or "timestamp" not in df.columns:
+            return pl.DataFrame()
+        return df.sort("timestamp").tail(n)
+
+    def get_gaps(
+        self,
+        key: str,
+        start: datetime,
+        end: datetime,
+        expected_interval: timedelta,
+    ) -> list[tuple[datetime, datetime]]:
+        """Detect gaps in a time-series based on expected interval."""
+        df = self.read(key, start=start.date(), end=end.date(), columns=["timestamp"])
+        if df.is_empty() or "timestamp" not in df.columns:
+            return [(start, end)]
+
+        df_sorted = df.sort("timestamp")
+        diffs = df_sorted.with_columns(pl.col("timestamp").diff().alias("_delta"))
+
+        tolerance = expected_interval.total_seconds() * 1.1
+        gaps: list[tuple[datetime, datetime]] = []
+
+        for row in diffs.iter_rows(named=True):
+            delta = row["_delta"]
+            ts = row["timestamp"]
+            if delta is None:
+                continue
+            if delta.total_seconds() > tolerance:
+                gap_start = ts - delta + expected_interval
+                gap_end = ts - expected_interval
+                if gap_end < gap_start:
+                    gap_end = gap_start
+                gaps.append((gap_start, gap_end))
+
+        # Check head/tail coverage
+        first_ts = df_sorted["timestamp"][0]
+        last_ts = df_sorted["timestamp"][-1]
+        if first_ts > start:
+            gap_end = min(first_ts - expected_interval, end)
+            if gap_end >= start:
+                gaps.insert(0, (start, gap_end))
+        if last_ts < end:
+            gap_start = last_ts + expected_interval
+            if gap_start <= end:
+                gaps.append((gap_start, end))
+
+        return gaps
 
     def _read_batched(
         self, lf: pl.LazyFrame, batch_size: int
@@ -530,7 +670,7 @@ class ParquetStore:
         key_path = self._key_to_path(key)
         if not key_path.exists():
             return False
-        return any(key_path.glob("*.parquet"))
+        return any(key_path.rglob("*.parquet"))
 
     def delete(self, key: str) -> bool:
         """Delete all data for a key.
@@ -550,33 +690,10 @@ class ParquetStore:
         if not key_path.exists():
             return False
 
-        parquet_files = list(key_path.glob("*.parquet"))
-        if not parquet_files:
+        if not any(key_path.rglob("*.parquet")):
             return False
 
-        # Remove all parquet files and lock file
-        for f in parquet_files:
-            f.unlink()
-
-        # Remove lock file if present
-        lock_file = key_path / ".lock"
-        if lock_file.exists():
-            lock_file.unlink()
-
-        # Remove empty directories up the tree
-        try:
-            key_path.rmdir()
-            # Try to remove parent directories if empty
-            parent = key_path.parent
-            while parent != self.data_root:
-                if not any(parent.iterdir()):
-                    parent.rmdir()
-                    parent = parent.parent
-                else:
-                    break
-        except OSError:
-            pass  # Directory not empty, which is fine
-
+        shutil.rmtree(key_path)
         logger.info("Deleted key %s", key)
         return True
 
@@ -589,16 +706,20 @@ class ParquetStore:
         Returns:
             List of matching storage keys
         """
-        keys: list[str] = []
+        keys: set[str] = set()
 
-        # Walk directory tree looking for parquet files
         for parquet_file in self.data_root.rglob("*.parquet"):
-            # Get key from path relative to data_root
-            rel_path = parquet_file.parent.relative_to(self.data_root)
-            key = str(rel_path)
-
-            if key not in keys and (not prefix or key.startswith(prefix)):
-                keys.append(key)
+            rel_parts = parquet_file.parent.relative_to(self.data_root).parts
+            trimmed_parts = []
+            for part in rel_parts:
+                if part.startswith("year=") or part.startswith("month="):
+                    break
+                trimmed_parts.append(part)
+            if not trimmed_parts:
+                continue
+            key = "/".join(trimmed_parts)
+            if not prefix or key.startswith(prefix):
+                keys.add(key)
 
         return sorted(keys)
 
@@ -619,27 +740,83 @@ class ParquetStore:
         if not key_path.exists():
             return None
 
-        parquet_files = list(key_path.glob("*.parquet"))
+        parquet_files = list(key_path.rglob("*.parquet"))
         if not parquet_files:
             return None
 
         try:
-            df = pl.read_parquet(key_path / "*.parquet")
+            min_dates: list[date] = []
+            max_dates: list[date] = []
 
-            if "timestamp" not in df.columns or df.is_empty():
+            for file in parquet_files:
+                parsed = parse_filename(file.name)
+                if parsed:
+                    start_ts, end_ts = parsed
+                    min_dates.append(start_ts.date())
+                    max_dates.append(end_ts.date())
+                else:
+                    df = pl.read_parquet(file)
+                    if "timestamp" not in df.columns or df.is_empty():
+                        continue
+                    min_ts = df["timestamp"].min()
+                    max_ts = df["timestamp"].max()
+                    if isinstance(min_ts, datetime) and isinstance(max_ts, datetime):
+                        min_dates.append(min_ts.date())
+                        max_dates.append(max_ts.date())
+
+            if not min_dates or not max_dates:
                 return None
 
-            min_ts = df["timestamp"].min()
-            max_ts = df["timestamp"].max()
-
-            if min_ts is None or max_ts is None:
-                return None
-
-            # Cast to datetime to get .date() method
-            if isinstance(min_ts, datetime) and isinstance(max_ts, datetime):
-                return (min_ts.date(), max_ts.date())
-
-            return None
+            return (min(min_dates), max(max_dates))
 
         except pl.exceptions.PolarsError:
             return None
+
+    def consolidate(
+        self, key: str, target_rows_per_file: int | None = None
+    ) -> dict[str, int]:
+        """Consolidate parquet files for a key into larger chunks.
+
+        Args:
+            key: Storage key
+            target_rows_per_file: Optional override for chunk sizing
+
+        Returns:
+            Stats dict with files_before, files_after, rows_processed
+        """
+        key_path = self._key_to_path(key)
+        parquet_files = list(key_path.rglob("*.parquet"))
+        files_before = len(parquet_files)
+
+        df = self.read(key)
+        rows = len(df)
+
+        if rows == 0:
+            return {"files_before": files_before, "files_after": files_before, "rows_processed": 0}
+
+        original_target = self.config.target_rows_per_file
+        if target_rows_per_file is not None:
+            self.config = ParquetStoreConfig(
+                target_rows_per_file=target_rows_per_file,
+                compression=self.config.compression,
+                compression_level=self.config.compression_level,
+                lock_timeout_seconds=self.config.lock_timeout_seconds,
+            )
+
+        self.write(key, df, mode="overwrite")
+
+        if target_rows_per_file is not None:
+            self.config = ParquetStoreConfig(
+                target_rows_per_file=original_target,
+                compression=self.config.compression,
+                compression_level=self.config.compression_level,
+                lock_timeout_seconds=self.config.lock_timeout_seconds,
+            )
+
+        files_after = len(list(self._key_to_path(key).rglob("*.parquet")))
+
+        return {
+            "files_before": files_before,
+            "files_after": files_after,
+            "rows_processed": rows,
+        }

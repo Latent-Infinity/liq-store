@@ -13,6 +13,8 @@ from liq.store.exceptions import (
     SchemaCompatibilityError,
     StorageError,
 )
+from liq.store import key_builder
+from liq.store.config import create_parquet_store_from_env, load_parquet_config_from_env
 from liq.store.naming import generate_filename, is_timestamp_filename, parse_filename
 from liq.store.parquet import ParquetStore, ParquetStoreConfig
 from liq.store.protocols import TimeSeriesStore
@@ -24,6 +26,10 @@ __all__ = [
     "ParquetStore",
     # Configuration
     "ParquetStoreConfig",
+    "load_parquet_config_from_env",
+    "create_parquet_store_from_env",
+    # Key helpers
+    "key_builder",
     # Naming utilities
     "generate_filename",
     "parse_filename",
