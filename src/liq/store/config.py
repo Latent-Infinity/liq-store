@@ -59,10 +59,12 @@ def create_parquet_store_from_env(env: Mapping[str, str] | None = None) -> Parqu
     """Create a ParquetStore using env for data root and config.
 
     Environment variables:
-    - LIQ_DATA_ROOT (defaults to "./data")
+    - DATA_ROOT (defaults to "./data")
     - See load_parquet_config_from_env for additional knobs
     """
     env = env or os.environ
-    data_root = env.get("LIQ_DATA_ROOT", "./data")
+    data_root = env.get("DATA_ROOT", "./data")
+    if data_root is None or not str(data_root).strip():
+        raise ValueError("DATA_ROOT must be set to a non-empty path")
     config = load_parquet_config_from_env(env)
     return ParquetStore(str(Path(data_root).expanduser()), config=config)

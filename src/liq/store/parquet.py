@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
 import polars as pl
+import pyarrow.dataset as ds
 
 from liq.store.exceptions import (
     ConcurrentWriteError,
@@ -549,27 +550,27 @@ class ParquetStore:
             # Use lazy scanning for memory efficiency
             lf = pl.scan_parquet(parquet_files)
 
-            # Apply column selection (predicate pushdown)
+            schema = lf.collect_schema()
+            has_timestamp = "timestamp" in schema
+
+            # Apply date filters if timestamp column exists
+            if (start is not None or end is not None) and has_timestamp:
+                if start is not None:
+                    start_dt = datetime.combine(start, datetime.min.time(), tzinfo=UTC)
+                    lf = lf.filter(pl.col("timestamp") >= start_dt)
+                if end is not None:
+                    end_dt = datetime.combine(end, datetime.max.time(), tzinfo=UTC)
+                    lf = lf.filter(pl.col("timestamp") <= end_dt)
+
+                lf = lf.sort("timestamp")
+
+            # Apply column selection after filtering/sorting
             if columns:
                 lf = lf.select(columns)
 
-            # Apply date filters if timestamp column exists
-            if start is not None or end is not None:
-                # Check if timestamp column exists by collecting schema
-                schema = lf.collect_schema()
-                if "timestamp" in schema:
-                    if start is not None:
-                        start_dt = datetime.combine(start, datetime.min.time(), tzinfo=UTC)
-                        lf = lf.filter(pl.col("timestamp") >= start_dt)
-                    if end is not None:
-                        end_dt = datetime.combine(end, datetime.max.time(), tzinfo=UTC)
-                        lf = lf.filter(pl.col("timestamp") <= end_dt)
-
-                    lf = lf.sort("timestamp")
-
             # Return based on requested mode
             if batch_size is not None:
-                return self._read_batched(lf, batch_size)
+                return self._read_batched(parquet_files, columns, start, end, batch_size)
 
             # Use streaming engine if requested (memory-efficient for large datasets)
             result = lf.collect(engine="streaming") if streaming else lf.collect()
@@ -634,26 +635,51 @@ class ParquetStore:
         return gaps
 
     def _read_batched(
-        self, lf: pl.LazyFrame, batch_size: int
+        self,
+        parquet_files: list[Path],
+        columns: list[str] | None,
+        start: date | None,
+        end: date | None,
+        batch_size: int,
     ) -> Iterator[pl.DataFrame]:
         """Read data in batches for memory efficiency.
 
         Args:
-            lf: LazyFrame to read from
+            parquet_files: List of parquet files to scan
+            columns: Optional list of columns to return
+            start: Optional start date filter (inclusive)
+            end: Optional end date filter (inclusive)
             batch_size: Number of rows per batch
 
         Yields:
             DataFrame batches
         """
-        # Collect full result (streaming engine helps with memory)
-        # Then yield in chunks
-        # Note: For truly large datasets, consider using pl.scan_parquet
-        # with row_index and filtering
-        df = lf.collect(engine="streaming")
-        total_rows = len(df)
+        dataset = ds.dataset([str(p) for p in parquet_files], format="parquet")
 
-        for start_idx in range(0, total_rows, batch_size):
-            yield df.slice(start_idx, batch_size)
+        filter_expr = None
+        if "timestamp" in dataset.schema.names and (start is not None or end is not None):
+            field = ds.field("timestamp")
+            if start is not None:
+                start_dt = datetime.combine(start, datetime.min.time(), tzinfo=UTC)
+                filter_expr = field >= start_dt
+            if end is not None:
+                end_dt = datetime.combine(end, datetime.max.time(), tzinfo=UTC)
+                end_expr = field <= end_dt
+                filter_expr = end_expr if filter_expr is None else (filter_expr & end_expr)
+
+        scanner = dataset.scanner(
+            columns=columns,
+            filter=filter_expr,
+            batch_size=batch_size,
+        )
+
+        for batch in scanner.to_batches():
+            if batch.num_rows == 0:
+                continue
+            df = pl.from_arrow(batch)
+            if "timestamp" in df.columns:
+                df = df.sort("timestamp")
+            yield df
 
     def exists(self, key: str) -> bool:
         """Check if data exists for a key.

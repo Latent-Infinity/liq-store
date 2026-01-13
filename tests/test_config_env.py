@@ -39,7 +39,7 @@ def test_load_parquet_config_invalid_int() -> None:
 
 def test_create_parquet_store_from_env(tmp_path) -> None:  # type: ignore[annotation-unchecked]
     env = {
-        "LIQ_DATA_ROOT": str(tmp_path),
+        "DATA_ROOT": str(tmp_path),
         "LIQ_STORAGE_TARGET_ROWS": "123",
     }
     store = create_parquet_store_from_env(env=env)
@@ -51,3 +51,8 @@ def test_create_parquet_store_uses_default_root(tmp_path, monkeypatch):  # type:
     monkeypatch.chdir(tmp_path)
     store = create_parquet_store_from_env(env={})
     assert store.data_root == Path("./data").resolve()
+
+
+def test_create_parquet_store_rejects_empty_root() -> None:
+    with pytest.raises(ValueError, match="DATA_ROOT must be set"):
+        create_parquet_store_from_env(env={"DATA_ROOT": " "})

@@ -17,3 +17,11 @@ def test_indicators_key() -> None:
 
 def test_fundamentals_key() -> None:
     assert key_builder.fundamentals("AAPL") == "AAPL/fundamentals"
+
+
+def test_quotes_key() -> None:
+    assert key_builder.quotes("EUR_USD") == "EUR_USD/quotes"
+
+
+def test_corp_actions_key() -> None:
+    assert key_builder.corp_actions("SPY") == "SPY/corp_actions"

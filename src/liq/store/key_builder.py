@@ -25,3 +25,13 @@ def indicators(symbol: str, indicator: str, params_id: str) -> str:
 def fundamentals(symbol: str) -> str:
     """Build key for fundamentals."""
     return f"{symbol}/fundamentals"
+
+
+def quotes(symbol: str) -> str:
+    """Build key for quotes."""
+    return f"{symbol}/quotes"
+
+
+def corp_actions(symbol: str) -> str:
+    """Build key for corporate actions."""
+    return f"{symbol}/corp_actions"

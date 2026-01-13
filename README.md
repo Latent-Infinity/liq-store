@@ -11,7 +11,7 @@ Storage abstraction layer for the LIQ (Latent Infinity Quant) Stack. Provides ba
 - **Schema Validation**: Type compatibility checked on append to prevent silent corruption
 - **Configurable Compression**: ZSTD compression with tunable levels
 - **Memory-Efficient Reading**: Optional streaming and batch modes for large datasets
-- **Standardized Keys**: Helper builders for bars/features/indicators/fundamentals so every producer shares the same layout
+- **Standardized Keys**: Helper builders for bars/features/indicators/fundamentals/quotes/corp_actions so every producer shares the same layout
 
 ## Installation
 
@@ -105,6 +105,8 @@ df = store.read(f"oanda/{key_builder.bars('EUR_USD', '1m')}", streaming=True)
 # Batch processing (very large datasets)
 for batch in store.read(f"oanda/{key_builder.bars('EUR_USD', '1m')}", batch_size=100_000):
     process(batch)
+
+# Batches are streamed from Parquet files and sorted by timestamp when present.
 ```
 
 ### Custom Configuration
