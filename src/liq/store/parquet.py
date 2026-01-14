@@ -35,6 +35,7 @@ import pyarrow.dataset as ds
 
 from liq.store.exceptions import (
     ConcurrentWriteError,
+    DataNotFoundError,
     PathTraversalError,
     SchemaCompatibilityError,
     StorageError,
@@ -447,6 +448,27 @@ class ParquetStore:
         except OSError as e:
             logger.error("Failed to write to %s: %s", key, e)
             raise StorageError(f"Failed to write data: {e}") from e
+
+    def write_overwrite(
+        self,
+        key: str,
+        data: pl.DataFrame,
+        *,
+        require_exists: bool = False,
+    ) -> None:
+        """Overwrite data for a key with explicit intent.
+
+        Args:
+            key: Storage key
+            data: Polars DataFrame with time-series data
+            require_exists: If True, raise when key does not exist
+
+        Raises:
+            DataNotFoundError: If require_exists is True and key doesn't exist
+        """
+        if require_exists and not self.exists(key):
+            raise DataNotFoundError(f"Key '{key}' does not exist for overwrite")
+        self.write(key, data, mode="overwrite")
 
     def _write_chunked(self, df: pl.DataFrame, path: Path) -> None:
         """Write DataFrame in optimally-sized chunks.

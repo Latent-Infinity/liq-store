@@ -10,6 +10,7 @@ import pytest
 
 from liq.store.exceptions import (
     ConcurrentWriteError,
+    DataNotFoundError,
     PathTraversalError,
     SchemaCompatibilityError,
     StorageError,
@@ -191,6 +192,39 @@ class TestSchemaCompatibility:
         result = store.read("test/key")
         assert len(result) == 2
         assert "new_column" in result.columns
+
+
+class TestExplicitOverwrite:
+    """Tests for explicit overwrite helper."""
+
+    def test_write_overwrite_replaces_data(
+        self, temp_storage_path: Path, sample_timestamp: datetime
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        df1 = pl.DataFrame({
+            "timestamp": [sample_timestamp],
+            "value": [1.0],
+        })
+        df2 = pl.DataFrame({
+            "timestamp": [sample_timestamp + timedelta(minutes=1)],
+            "value": [2.0],
+        })
+        store.write("test/overwrite", df1)
+        store.write_overwrite("test/overwrite", df2)
+        result = store.read("test/overwrite")
+        assert len(result) == 1
+        assert result["value"][0] == 2.0
+
+    def test_write_overwrite_require_exists(
+        self, temp_storage_path: Path, sample_timestamp: datetime
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        df = pl.DataFrame({
+            "timestamp": [sample_timestamp],
+            "value": [1.0],
+        })
+        with pytest.raises(DataNotFoundError):
+            store.write_overwrite("missing/key", df, require_exists=True)
 
     def test_append_incompatible_types_raises_error(
         self, temp_storage_path: Path, sample_timestamp: datetime

@@ -35,3 +35,13 @@ def quotes(symbol: str) -> str:
 def corp_actions(symbol: str) -> str:
     """Build key for corporate actions."""
     return f"{symbol}/corp_actions"
+
+
+def dataset(dataset_hash: str, artifact: str) -> str:
+    """Build key for dataset artifacts."""
+    return f"datasets/{dataset_hash}/{artifact}"
+
+
+def model(model_hash: str, artifact: str) -> str:
+    """Build key for model artifacts."""
+    return f"models/{model_hash}/{artifact}"

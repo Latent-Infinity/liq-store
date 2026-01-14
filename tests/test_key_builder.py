@@ -25,3 +25,11 @@ def test_quotes_key() -> None:
 
 def test_corp_actions_key() -> None:
     assert key_builder.corp_actions("SPY") == "SPY/corp_actions"
+
+
+def test_dataset_key() -> None:
+    assert key_builder.dataset("hash123", "X.parquet") == "datasets/hash123/X.parquet"
+
+
+def test_model_key() -> None:
+    assert key_builder.model("modelhash", "weights.pt") == "models/modelhash/weights.pt"
