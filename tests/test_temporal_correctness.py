@@ -5,12 +5,10 @@ Following TDD: Tests verify timestamp handling, UTC enforcement, and data integr
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import polars as pl
-import pytest
 
 from liq.store.naming import generate_filename, parse_filename
 from liq.store.parquet import ParquetStore
@@ -20,7 +18,7 @@ class TestTimestampUTCEnforcement:
     """Tests verifying UTC timezone handling in storage operations."""
 
     def test_read_filter_uses_utc_for_start_date(
-        self, temp_storage_path: Path, sample_timestamp: datetime
+        self, temp_storage_path: Path
     ) -> None:
         """Date filter for start should use UTC midnight."""
         store = ParquetStore(str(temp_storage_path))

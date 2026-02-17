@@ -4,10 +4,11 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-import pyarrow as pa
 import polars as pl
+import pyarrow as pa
 import pytest
 
+from liq.store import parquet as parquet_module
 from liq.store.exceptions import (
     ConcurrentWriteError,
     DataNotFoundError,
@@ -15,7 +16,6 @@ from liq.store.exceptions import (
     SchemaCompatibilityError,
     StorageError,
 )
-from liq.store import parquet as parquet_module
 from liq.store.parquet import FcntlPartitionLock, ParquetStore, ParquetStoreConfig
 
 
@@ -953,9 +953,11 @@ class TestParquetStoreCoverage:
         })
         store.write(key, df)
 
-        with patch("liq.store.parquet.pl.read_parquet", side_effect=pl.exceptions.PolarsError("bad")):
-            with pytest.raises(StorageError):
-                store.write(key, df, mode="append")
+        with (
+            patch("liq.store.parquet.pl.read_parquet", side_effect=pl.exceptions.PolarsError("bad")),
+            pytest.raises(StorageError),
+        ):
+            store.write(key, df, mode="append")
 
     def test_write_chunked_empty_df_no_output(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
@@ -977,9 +979,11 @@ class TestParquetStoreCoverage:
         store = ParquetStore(str(temp_storage_path))
         store.write("forex/EUR_USD", pl.DataFrame({"timestamp": [datetime(2024, 1, 1, tzinfo=UTC)], "value": [1]}))
 
-        with patch("liq.store.parquet.pl.scan_parquet", side_effect=pl.exceptions.PolarsError("boom")):
-            with pytest.raises(StorageError):
-                store.read("forex/EUR_USD")
+        with (
+            patch("liq.store.parquet.pl.scan_parquet", side_effect=pl.exceptions.PolarsError("boom")),
+            pytest.raises(StorageError),
+        ):
+            store.read("forex/EUR_USD")
 
     def test_read_latest_without_timestamp_returns_empty(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
@@ -1048,10 +1052,12 @@ class TestParquetStoreCoverage:
         class FakeDataset:
             schema = pa.schema([("timestamp", pa.timestamp("us", tz="UTC"))])
 
-            def scanner(self, columns=None, filter=None, batch_size=None) -> FakeScanner:  # noqa: ANN001
+            def scanner(self, _columns=None, _filter=None, _batch_size=None) -> FakeScanner:  # noqa: ANN001
                 return FakeScanner()
 
-        monkeypatch.setattr(parquet_module.ds, "dataset", lambda *args, **kwargs: FakeDataset())
+        monkeypatch.setattr(
+            parquet_module.ds, "dataset", lambda *_args, **_kwargs: FakeDataset()
+        )
 
         batches = list(store._read_batched([temp_storage_path / "fake.parquet"], None, None, None, 10))
         assert batches == []

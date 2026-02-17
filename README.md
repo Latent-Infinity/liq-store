@@ -16,13 +16,13 @@ Storage abstraction layer for the LIQ (Latent Infinity Quant) Stack. Provides ba
 ## Installation
 
 ```bash
-pip install liq-store
+uv pip install liq-store
 ```
 
 Or for development:
 
 ```bash
-pip install -e ".[dev]"
+uv pip install -e ".[dev]"
 ```
 
 ## Quick Start
@@ -247,7 +247,7 @@ except StorageError as e:
 
 ```bash
 # Install dev dependencies
-pip install -e ".[dev]"
+uv pip install -e ".[dev]"
 
 # Run tests
 pytest

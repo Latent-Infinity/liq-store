@@ -1,6 +1,5 @@
 """Tests for environment-based configuration helpers."""
 
-import os
 from pathlib import Path
 
 import pytest

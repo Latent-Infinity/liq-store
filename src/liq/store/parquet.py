@@ -25,9 +25,9 @@ import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast, overload
 from uuid import uuid4
 
 import polars as pl
@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
 # Type for valid Parquet compression options
-CompressionType = Literal["lz4", "uncompressed", "snappy", "gzip", "lzo", "brotli", "zstd"]
+CompressionType = Literal["lz4", "uncompressed", "snappy", "gzip", "brotli", "zstd"]
 
 logger = logging.getLogger(__name__)
 
@@ -502,7 +502,7 @@ class ParquetStore:
             min_ts = chunk["timestamp"].min()
             max_ts = chunk["timestamp"].max()
 
-            if min_ts is not None and max_ts is not None:
+            if isinstance(min_ts, datetime) and isinstance(max_ts, datetime):
                 filename = generate_filename(min_ts, max_ts)
             else:
                 filename = f"chunk_{start_idx}.parquet"
@@ -512,6 +512,32 @@ class ParquetStore:
                 compression=self.config.compression,
                 compression_level=self.config.compression_level,
             )
+
+    @overload
+    def read(
+        self,
+        key: str,
+        start: date | None = None,
+        end: date | None = None,
+        columns: list[str] | None = None,
+        *,
+        streaming: bool = False,
+        batch_size: None = None,
+    ) -> pl.DataFrame:
+        ...
+
+    @overload
+    def read(
+        self,
+        key: str,
+        start: date | None = None,
+        end: date | None = None,
+        columns: list[str] | None = None,
+        *,
+        streaming: bool = False,
+        batch_size: int,
+    ) -> Iterator[pl.DataFrame]:
+        ...
 
     def read(
         self,
@@ -595,8 +621,11 @@ class ParquetStore:
                 return self._read_batched(parquet_files, columns, start, end, batch_size)
 
             # Use streaming engine if requested (memory-efficient for large datasets)
-            result = lf.collect(engine="streaming") if streaming else lf.collect()
-            logger.debug("Read %d rows from %s", len(result), key)
+            result = cast(
+                pl.DataFrame,
+                lf.collect(engine="streaming") if streaming else lf.collect(),
+            )
+            logger.debug("Read %d rows from %s", result.height, key)
             return result
 
         except PathTraversalError:
@@ -698,7 +727,7 @@ class ParquetStore:
         for batch in scanner.to_batches():
             if batch.num_rows == 0:
                 continue
-            df = pl.from_arrow(batch)
+            df = cast(pl.DataFrame, pl.from_arrow(batch))
             if "timestamp" in df.columns:
                 df = df.sort("timestamp")
             yield df
