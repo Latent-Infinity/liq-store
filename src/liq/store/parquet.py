@@ -718,11 +718,16 @@ class ParquetStore:
                 end_expr = field <= end_dt
                 filter_expr = end_expr if filter_expr is None else (filter_expr & end_expr)
 
-        scanner = dataset.scanner(
-            columns=columns,
-            filter=filter_expr,
-            batch_size=batch_size,
-        )
+        try:
+            scanner = dataset.scanner(
+                columns=columns,
+                filter=filter_expr,
+                batch_size=batch_size,
+            )
+        except TypeError:
+            # Compatibility shim for datasets whose `scanner` method does not
+            # support keyword arguments in tests/mocks or legacy backends.
+            scanner = dataset.scanner(columns, filter_expr, batch_size)
 
         for batch in scanner.to_batches():
             if batch.num_rows == 0:

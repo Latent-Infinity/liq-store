@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "liq-store"
-version = "0.1.0"
+version = "0.1.1"
 description = "Storage abstraction layer for the LIQ Stack"
 readme = "README.md"
 license = "MIT"
@@ -32,7 +32,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "liq-core>=0.1.0",
+    "liq-core>=0.1.1",
     "polars>=1.20",
     "pyarrow>=18.0",
 ]

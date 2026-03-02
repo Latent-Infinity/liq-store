@@ -42,5 +42,3 @@ __all__ = [
     "PathTraversalError",
     "SchemaCompatibilityError",
 ]
-
-__version__ = "0.1.0"
