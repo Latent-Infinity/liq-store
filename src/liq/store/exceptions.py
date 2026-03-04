@@ -64,3 +64,15 @@ class SchemaCompatibilityError(StorageError):
     """
 
     pass
+
+
+class SchemaVersionError(StorageError):
+    """Exception raised for unsupported or invalid artifact schema versions."""
+
+    pass
+
+
+class ArtifactMigrationError(SchemaVersionError):
+    """Exception raised when an artifact schema migration fails."""
+
+    pass

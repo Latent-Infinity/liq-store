@@ -209,3 +209,6 @@ __marimo__/
 
 # macOS finder junk
 .DS_Store
+
+# Serena
+.serena/

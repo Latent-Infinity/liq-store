@@ -33,3 +33,10 @@ def test_dataset_key() -> None:
 
 def test_model_key() -> None:
     assert key_builder.model("modelhash", "weights.pt") == "models/modelhash/weights.pt"
+
+
+def test_evolution_run_key() -> None:
+    assert (
+        key_builder.evolution_run("run-123", "manifest.json")
+        == "evolution/runs/run-123/manifest.json"
+    )

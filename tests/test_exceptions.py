@@ -3,11 +3,13 @@
 import pytest
 
 from liq.store.exceptions import (
+    ArtifactMigrationError,
     ConcurrentWriteError,
     DataCorruptionError,
     DataNotFoundError,
     PathTraversalError,
     SchemaCompatibilityError,
+    SchemaVersionError,
     StorageError,
 )
 
@@ -106,3 +108,35 @@ class TestSchemaCompatibilityError:
     def test_can_catch_specifically(self) -> None:
         with pytest.raises(SchemaCompatibilityError):
             raise SchemaCompatibilityError("incompatible schema")
+
+
+class TestSchemaVersionError:
+    """Tests for SchemaVersionError exception."""
+
+    def test_inherits_from_storage_error(self) -> None:
+        error = SchemaVersionError("unsupported version")
+        assert isinstance(error, StorageError)
+
+    def test_can_catch_as_storage_error(self) -> None:
+        with pytest.raises(StorageError):
+            raise SchemaVersionError("unsupported version")
+
+    def test_can_catch_specifically(self) -> None:
+        with pytest.raises(SchemaVersionError):
+            raise SchemaVersionError("unsupported version")
+
+
+class TestArtifactMigrationError:
+    """Tests for ArtifactMigrationError exception."""
+
+    def test_inherits_from_schema_version_error(self) -> None:
+        error = ArtifactMigrationError("migration failed")
+        assert isinstance(error, SchemaVersionError)
+
+    def test_can_catch_as_storage_error(self) -> None:
+        with pytest.raises(StorageError):
+            raise ArtifactMigrationError("migration failed")
+
+    def test_can_catch_specifically(self) -> None:
+        with pytest.raises(ArtifactMigrationError):
+            raise ArtifactMigrationError("migration failed")

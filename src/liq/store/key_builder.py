@@ -45,3 +45,8 @@ def dataset(dataset_hash: str, artifact: str) -> str:
 def model(model_hash: str, artifact: str) -> str:
     """Build key for model artifacts."""
     return f"models/{model_hash}/{artifact}"
+
+
+def evolution_run(run_id: str, artifact: str = "run.json") -> str:
+    """Build key for evolution run artifacts."""
+    return f"evolution/runs/{run_id}/{artifact}"
