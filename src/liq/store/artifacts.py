@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import platform
 import sys
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from liq.core.security import serialize_sensitive_payload
 from liq.store.exceptions import ArtifactMigrationError, PathTraversalError, SchemaVersionError

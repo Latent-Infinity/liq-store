@@ -40,12 +40,8 @@ def load_parquet_config_from_env(env: Mapping[str, str] | None = None) -> Parque
 
     target_rows = _int("LIQ_STORAGE_TARGET_ROWS", ParquetStoreConfig.target_rows_per_file)
     compression = env.get("LIQ_STORAGE_COMPRESSION", ParquetStoreConfig.compression)
-    compression_level = _int(
-        "LIQ_STORAGE_COMPRESSION_LEVEL", ParquetStoreConfig.compression_level
-    )
-    lock_timeout = _int(
-        "LIQ_STORAGE_LOCK_TIMEOUT", ParquetStoreConfig.lock_timeout_seconds
-    )
+    compression_level = _int("LIQ_STORAGE_COMPRESSION_LEVEL", ParquetStoreConfig.compression_level)
+    lock_timeout = _int("LIQ_STORAGE_LOCK_TIMEOUT", ParquetStoreConfig.lock_timeout_seconds)
 
     return ParquetStoreConfig(
         target_rows_per_file=target_rows,

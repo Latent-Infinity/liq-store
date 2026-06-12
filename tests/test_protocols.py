@@ -12,9 +12,7 @@ class TestTimeSeriesStoreProtocol:
 
     def test_protocol_is_runtime_checkable(self) -> None:
         """Protocol should be runtime checkable."""
-        assert hasattr(TimeSeriesStore, "__protocol_attrs__") or isinstance(
-            TimeSeriesStore, type
-        )
+        assert hasattr(TimeSeriesStore, "__protocol_attrs__") or isinstance(TimeSeriesStore, type)
 
     def test_protocol_defines_write(self) -> None:
         """Protocol should define write method."""
@@ -59,7 +57,10 @@ class MockTimeSeriesStore:
             self._data[key] = data
 
     def read(
-        self, key: str, start: date | None = None, end: date | None = None  # noqa: ARG002
+        self,
+        key: str,
+        start: date | None = None,  # noqa: ARG002
+        end: date | None = None,  # noqa: ARG002
     ) -> pl.DataFrame:
         if key not in self._data:
             return pl.DataFrame()

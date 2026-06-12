@@ -130,9 +130,7 @@ class TestPathTraversal:
         with pytest.raises(PathTraversalError):
             store.delete("../escape")
 
-    def test_get_date_range_rejects_path_traversal(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_get_date_range_rejects_path_traversal(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
 
         with pytest.raises(PathTraversalError):
@@ -155,14 +153,18 @@ class TestSchemaCompatibility:
     ) -> None:
         store = ParquetStore(str(temp_storage_path))
 
-        df1 = pl.DataFrame({
-            "timestamp": [sample_timestamp],
-            "value": [1.0],
-        })
-        df2 = pl.DataFrame({
-            "timestamp": [sample_timestamp + timedelta(minutes=1)],
-            "value": [2.0],
-        })
+        df1 = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp],
+                "value": [1.0],
+            }
+        )
+        df2 = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp + timedelta(minutes=1)],
+                "value": [2.0],
+            }
+        )
 
         store.write("test/key", df1)
         store.write("test/key", df2, mode="append")
@@ -176,15 +178,19 @@ class TestSchemaCompatibility:
         """Schema evolution: adding new columns should work."""
         store = ParquetStore(str(temp_storage_path))
 
-        df1 = pl.DataFrame({
-            "timestamp": [sample_timestamp],
-            "value": [1.0],
-        })
-        df2 = pl.DataFrame({
-            "timestamp": [sample_timestamp + timedelta(minutes=1)],
-            "value": [2.0],
-            "new_column": ["extra"],  # New column
-        })
+        df1 = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp],
+                "value": [1.0],
+            }
+        )
+        df2 = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp + timedelta(minutes=1)],
+                "value": [2.0],
+                "new_column": ["extra"],  # New column
+            }
+        )
 
         store.write("test/key", df1)
         store.write("test/key", df2, mode="append")
@@ -201,14 +207,18 @@ class TestExplicitOverwrite:
         self, temp_storage_path: Path, sample_timestamp: datetime
     ) -> None:
         store = ParquetStore(str(temp_storage_path))
-        df1 = pl.DataFrame({
-            "timestamp": [sample_timestamp],
-            "value": [1.0],
-        })
-        df2 = pl.DataFrame({
-            "timestamp": [sample_timestamp + timedelta(minutes=1)],
-            "value": [2.0],
-        })
+        df1 = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp],
+                "value": [1.0],
+            }
+        )
+        df2 = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp + timedelta(minutes=1)],
+                "value": [2.0],
+            }
+        )
         store.write("test/overwrite", df1)
         store.write_overwrite("test/overwrite", df2)
         result = store.read("test/overwrite")
@@ -219,10 +229,12 @@ class TestExplicitOverwrite:
         self, temp_storage_path: Path, sample_timestamp: datetime
     ) -> None:
         store = ParquetStore(str(temp_storage_path))
-        df = pl.DataFrame({
-            "timestamp": [sample_timestamp],
-            "value": [1.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp],
+                "value": [1.0],
+            }
+        )
         with pytest.raises(DataNotFoundError):
             store.write_overwrite("missing/key", df, require_exists=True)
 
@@ -231,14 +243,18 @@ class TestExplicitOverwrite:
     ) -> None:
         store = ParquetStore(str(temp_storage_path))
 
-        df1 = pl.DataFrame({
-            "timestamp": [sample_timestamp],
-            "value": [1.0],  # Float
-        })
-        df2 = pl.DataFrame({
-            "timestamp": [sample_timestamp + timedelta(minutes=1)],
-            "value": ["string"],  # String - incompatible!
-        })
+        df1 = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp],
+                "value": [1.0],  # Float
+            }
+        )
+        df2 = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp + timedelta(minutes=1)],
+                "value": ["string"],  # String - incompatible!
+            }
+        )
 
         store.write("test/key", df1)
 
@@ -251,14 +267,18 @@ class TestExplicitOverwrite:
         """Numeric type widening (Int32 -> Int64) should be allowed."""
         store = ParquetStore(str(temp_storage_path))
 
-        df1 = pl.DataFrame({
-            "timestamp": [sample_timestamp],
-            "value": pl.Series([1], dtype=pl.Int32),
-        })
-        df2 = pl.DataFrame({
-            "timestamp": [sample_timestamp + timedelta(minutes=1)],
-            "value": pl.Series([2], dtype=pl.Int64),
-        })
+        df1 = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp],
+                "value": pl.Series([1], dtype=pl.Int32),
+            }
+        )
+        df2 = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp + timedelta(minutes=1)],
+                "value": pl.Series([2], dtype=pl.Int64),
+            }
+        )
 
         store.write("test/key", df1)
         store.write("test/key", df2, mode="append")
@@ -338,10 +358,12 @@ class TestAtomicWrites:
         store.write("forex/EUR_USD", sample_ohlcv_df)
 
         # Create incompatible data that will fail schema check
-        bad_df = pl.DataFrame({
-            "timestamp": [datetime.now(UTC)],
-            "symbol": [123],  # Wrong type - was string before
-        })
+        bad_df = pl.DataFrame(
+            {
+                "timestamp": [datetime.now(UTC)],
+                "symbol": [123],  # Wrong type - was string before
+            }
+        )
 
         with pytest.raises(SchemaCompatibilityError):
             store.write("forex/EUR_USD", bad_df, mode="append")
@@ -361,10 +383,12 @@ class TestAtomicWrites:
         original_count = len(store.read("forex/EUR_USD"))
 
         # Incompatible append should fail
-        bad_df = pl.DataFrame({
-            "timestamp": [datetime.now(UTC)],
-            "open": ["not_a_number"],  # Wrong type
-        })
+        bad_df = pl.DataFrame(
+            {
+                "timestamp": [datetime.now(UTC)],
+                "open": ["not_a_number"],  # Wrong type
+            }
+        )
 
         with pytest.raises(SchemaCompatibilityError):
             store.write("forex/EUR_USD", bad_df, mode="append")
@@ -424,11 +448,13 @@ class TestParquetStoreWrite:
         self, temp_storage_path: Path, sample_timestamp: datetime
     ) -> None:
         store = ParquetStore(str(temp_storage_path))
-        df = pl.DataFrame({
-            "timestamp": [sample_timestamp],
-            "symbol": ["EUR_USD"],
-            "value": [1.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [sample_timestamp],
+                "symbol": ["EUR_USD"],
+                "value": [1.0],
+            }
+        )
         store.write("forex/EUR_USD", df)
 
         year_dir = temp_storage_path / "forex" / "EUR_USD" / f"year={sample_timestamp.year}"
@@ -455,9 +481,7 @@ class TestParquetStoreWrite:
         # Should create data.parquet file
         assert (temp_storage_path / "test" / "no_timestamp" / "data.parquet").exists()
 
-    def test_write_append_without_timestamp_column(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_write_append_without_timestamp_column(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         df1 = pl.DataFrame({"symbol": ["EUR_USD"], "value": [1.0]})
         df2 = pl.DataFrame({"symbol": ["GBP_USD"], "value": [2.0]})
@@ -468,9 +492,7 @@ class TestParquetStoreWrite:
         result = store.read("test/no_ts")
         assert len(result) == 2
 
-    def test_write_raises_storage_error_on_os_error(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_write_raises_storage_error_on_os_error(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         df = pl.DataFrame({"value": [1.0]})
 
@@ -507,11 +529,13 @@ class TestParquetStoreRead:
             sample_timestamp + timedelta(days=1),
             sample_timestamp + timedelta(days=2),
         ]
-        df = pl.DataFrame({
-            "timestamp": timestamps,
-            "symbol": ["EUR_USD"] * 3,
-            "value": [1.0, 2.0, 3.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": timestamps,
+                "symbol": ["EUR_USD"] * 3,
+                "value": [1.0, 2.0, 3.0],
+            }
+        )
         store.write("forex/EUR_USD", df)
 
         # Filter to just the first day (exclusive of day+1)
@@ -531,11 +555,13 @@ class TestParquetStoreRead:
             sample_timestamp + timedelta(days=1),
             sample_timestamp + timedelta(days=2),
         ]
-        df = pl.DataFrame({
-            "timestamp": timestamps,
-            "symbol": ["EUR_USD"] * 3,
-            "value": [1.0, 2.0, 3.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": timestamps,
+                "symbol": ["EUR_USD"] * 3,
+                "value": [1.0, 2.0, 3.0],
+            }
+        )
         store.write("forex/EUR_USD", df)
 
         # Filter with start only
@@ -554,11 +580,13 @@ class TestParquetStoreRead:
             sample_timestamp + timedelta(days=1),
             sample_timestamp + timedelta(days=2),
         ]
-        df = pl.DataFrame({
-            "timestamp": timestamps,
-            "symbol": ["EUR_USD"] * 3,
-            "value": [1.0, 2.0, 3.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": timestamps,
+                "symbol": ["EUR_USD"] * 3,
+                "value": [1.0, 2.0, 3.0],
+            }
+        )
         store.write("forex/EUR_USD", df)
 
         # Filter with end only
@@ -567,9 +595,7 @@ class TestParquetStoreRead:
 
         assert len(result) == 1  # Should get only day 0
 
-    def test_read_latest(
-        self, temp_storage_path: Path, sample_timestamp: datetime
-    ) -> None:
+    def test_read_latest(self, temp_storage_path: Path, sample_timestamp: datetime) -> None:
         store = ParquetStore(str(temp_storage_path))
 
         timestamps = [
@@ -577,20 +603,20 @@ class TestParquetStoreRead:
             sample_timestamp + timedelta(days=1),
             sample_timestamp + timedelta(days=2),
         ]
-        df = pl.DataFrame({
-            "timestamp": timestamps,
-            "symbol": ["EUR_USD"] * 3,
-            "value": [1.0, 2.0, 3.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": timestamps,
+                "symbol": ["EUR_USD"] * 3,
+                "value": [1.0, 2.0, 3.0],
+            }
+        )
         store.write("forex/EUR_USD", df)
 
         latest = store.read_latest("forex/EUR_USD", n=1)
         assert len(latest) == 1
         assert latest["timestamp"][0] == sample_timestamp + timedelta(days=2)
 
-    def test_read_without_timestamp_column_ignores_filters(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_read_without_timestamp_column_ignores_filters(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         df = pl.DataFrame({"symbol": ["EUR_USD", "GBP_USD"], "value": [1.0, 2.0]})
         store.write("test/no_ts", df)
@@ -661,16 +687,12 @@ class TestParquetStoreExists:
 class TestParquetStoreDelete:
     """Tests for ParquetStore.delete method."""
 
-    def test_delete_returns_false_for_nonexistent(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_delete_returns_false_for_nonexistent(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         result = store.delete("nonexistent/key")
         assert result is False
 
-    def test_delete_returns_false_for_empty_directory(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_delete_returns_false_for_empty_directory(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         # Create directory but no parquet files
         (temp_storage_path / "empty" / "key").mkdir(parents=True)
@@ -770,25 +792,19 @@ class TestParquetStoreListKeys:
 class TestParquetStoreGetDateRange:
     """Tests for ParquetStore.get_date_range method."""
 
-    def test_get_date_range_nonexistent_returns_none(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_get_date_range_nonexistent_returns_none(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         result = store.get_date_range("nonexistent/key")
         assert result is None
 
-    def test_get_date_range_empty_directory_returns_none(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_get_date_range_empty_directory_returns_none(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         # Create directory but no parquet files
         (temp_storage_path / "empty" / "key").mkdir(parents=True)
         result = store.get_date_range("empty/key")
         assert result is None
 
-    def test_get_date_range_no_timestamp_column_returns_none(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_get_date_range_no_timestamp_column_returns_none(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         df = pl.DataFrame({"symbol": ["EUR_USD", "GBP_USD"], "value": [1.0, 2.0]})
         store.write("test/no_ts", df)
@@ -796,15 +812,15 @@ class TestParquetStoreGetDateRange:
         result = store.get_date_range("test/no_ts")
         assert result is None
 
-    def test_get_date_range_empty_dataframe_returns_none(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_get_date_range_empty_dataframe_returns_none(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         # Write some data first, then overwrite with non-empty but all-null timestamps
-        df = pl.DataFrame({
-            "timestamp": pl.Series([], dtype=pl.Datetime("us", "UTC")),
-            "value": pl.Series([], dtype=pl.Float64),
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": pl.Series([], dtype=pl.Datetime("us", "UTC")),
+                "value": pl.Series([], dtype=pl.Float64),
+            }
+        )
         # Need to manually write a parquet file with empty data
         key_path = temp_storage_path / "test" / "empty_ts"
         key_path.mkdir(parents=True)
@@ -823,11 +839,13 @@ class TestParquetStoreGetDateRange:
             sample_timestamp + timedelta(days=5),
             sample_timestamp + timedelta(days=10),
         ]
-        df = pl.DataFrame({
-            "timestamp": timestamps,
-            "symbol": ["EUR_USD"] * 3,
-            "value": [1.0, 2.0, 3.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": timestamps,
+                "symbol": ["EUR_USD"] * 3,
+                "value": [1.0, 2.0, 3.0],
+            }
+        )
         store.write("forex/EUR_USD", df)
 
         result = store.get_date_range("forex/EUR_USD")
@@ -841,7 +859,10 @@ class TestLogging:
     """Tests for logging behavior."""
 
     def test_write_logs_on_success(
-        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame, caplog: pytest.LogCaptureFixture
+        self,
+        temp_storage_path: Path,
+        sample_ohlcv_df: pl.DataFrame,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         import logging
 
@@ -849,10 +870,16 @@ class TestLogging:
             store = ParquetStore(str(temp_storage_path))
             store.write("forex/EUR_USD", sample_ohlcv_df)
 
-        assert any("Wrote" in record.message and "forex/EUR_USD" in record.message for record in caplog.records)
+        assert any(
+            "Wrote" in record.message and "forex/EUR_USD" in record.message
+            for record in caplog.records
+        )
 
     def test_read_logs_debug_info(
-        self, temp_storage_path: Path, sample_ohlcv_df: pl.DataFrame, caplog: pytest.LogCaptureFixture
+        self,
+        temp_storage_path: Path,
+        sample_ohlcv_df: pl.DataFrame,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         import logging
 
@@ -872,7 +899,9 @@ class TestParquetStoreCoverage:
         lock = FcntlPartitionLock(temp_storage_path)
         lock.release()
 
-    def test_lock_acquire_handles_base_exception(self, temp_storage_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_lock_acquire_handles_base_exception(
+        self, temp_storage_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         lock = FcntlPartitionLock(temp_storage_path)
 
         def raise_error(_fd: int, _flags: int) -> None:
@@ -885,16 +914,20 @@ class TestParquetStoreCoverage:
 
     def test_merge_and_dedupe_keeps_distinct_providers(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
-        existing = pl.DataFrame({
-            "timestamp": [datetime(2024, 1, 1, tzinfo=UTC)],
-            "symbol": ["EUR_USD"],
-            "provider": ["oanda"],
-        })
-        new = pl.DataFrame({
-            "timestamp": [datetime(2024, 1, 1, tzinfo=UTC)],
-            "symbol": ["EUR_USD"],
-            "provider": ["binance"],
-        })
+        existing = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, 1, tzinfo=UTC)],
+                "symbol": ["EUR_USD"],
+                "provider": ["oanda"],
+            }
+        )
+        new = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, 1, tzinfo=UTC)],
+                "symbol": ["EUR_USD"],
+                "provider": ["binance"],
+            }
+        )
         merged = store._merge_and_dedupe(existing, new)
         assert len(merged) == 2
 
@@ -902,29 +935,33 @@ class TestParquetStoreCoverage:
         store = ParquetStore(str(temp_storage_path))
         key = "forex/EUR_USD"
 
-        df = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 5, tzinfo=UTC),
-                datetime(2024, 2, 5, tzinfo=UTC),
-            ],
-            "open": [1.0, 1.1],
-            "high": [1.1, 1.2],
-            "low": [0.9, 1.0],
-            "close": [1.05, 1.15],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 5, tzinfo=UTC),
+                    datetime(2024, 2, 5, tzinfo=UTC),
+                ],
+                "open": [1.0, 1.1],
+                "high": [1.1, 1.2],
+                "low": [0.9, 1.0],
+                "close": [1.05, 1.15],
+            }
+        )
         store.write(key, df)
 
         invalid_dir = temp_storage_path / "forex" / "EUR_USD" / "year=bad" / "month=01"
         invalid_dir.mkdir(parents=True)
         pl.DataFrame({"value": [1]}).write_parquet(invalid_dir / "data.parquet")
 
-        append_df = pl.DataFrame({
-            "timestamp": [datetime(2024, 1, 10, tzinfo=UTC)],
-            "open": [1.2],
-            "high": [1.3],
-            "low": [1.1],
-            "close": [1.25],
-        })
+        append_df = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, 10, tzinfo=UTC)],
+                "open": [1.2],
+                "high": [1.3],
+                "low": [1.1],
+                "close": [1.25],
+            }
+        )
         store.write(key, append_df, mode="append")
 
         result = store.read(key)
@@ -947,14 +984,18 @@ class TestParquetStoreCoverage:
     def test_write_wraps_polars_errors(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         key = "forex/EUR_USD"
-        df = pl.DataFrame({
-            "timestamp": [datetime(2024, 1, 1, tzinfo=UTC)],
-            "open": [1.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, 1, tzinfo=UTC)],
+                "open": [1.0],
+            }
+        )
         store.write(key, df)
 
         with (
-            patch("liq.store.parquet.pl.read_parquet", side_effect=pl.exceptions.PolarsError("bad")),
+            patch(
+                "liq.store.parquet.pl.read_parquet", side_effect=pl.exceptions.PolarsError("bad")
+            ),
             pytest.raises(StorageError),
         ):
             store.write(key, df, mode="append")
@@ -968,19 +1009,26 @@ class TestParquetStoreCoverage:
     def test_write_chunked_uses_fallback_filename(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         path = temp_storage_path / "fallback"
-        df = pl.DataFrame({
-            "timestamp": pl.Series([None, None], dtype=pl.Datetime("us", "UTC")),
-            "value": [1.0, 2.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": pl.Series([None, None], dtype=pl.Datetime("us", "UTC")),
+                "value": [1.0, 2.0],
+            }
+        )
         store._write_chunked(df, path)
         assert (path / "chunk_0.parquet").exists()
 
     def test_read_wraps_polars_errors(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
-        store.write("forex/EUR_USD", pl.DataFrame({"timestamp": [datetime(2024, 1, 1, tzinfo=UTC)], "value": [1]}))
+        store.write(
+            "forex/EUR_USD",
+            pl.DataFrame({"timestamp": [datetime(2024, 1, 1, tzinfo=UTC)], "value": [1]}),
+        )
 
         with (
-            patch("liq.store.parquet.pl.scan_parquet", side_effect=pl.exceptions.PolarsError("boom")),
+            patch(
+                "liq.store.parquet.pl.scan_parquet", side_effect=pl.exceptions.PolarsError("boom")
+            ),
             pytest.raises(StorageError),
         ):
             store.read("forex/EUR_USD")
@@ -1000,12 +1048,14 @@ class TestParquetStoreCoverage:
     def test_get_gaps_handles_short_gap_and_head_tail(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         key = "forex/EUR_USD"
-        df = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
-                datetime(2024, 1, 1, 1, 30, tzinfo=UTC),
-            ]
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 1, 0, 0, tzinfo=UTC),
+                    datetime(2024, 1, 1, 1, 30, tzinfo=UTC),
+                ]
+            }
+        )
         store.write(key, df)
 
         start = datetime(2023, 12, 31, 23, 0, tzinfo=UTC)
@@ -1018,14 +1068,16 @@ class TestParquetStoreCoverage:
     def test_read_batched_filters_and_sorts(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         key = "forex/EUR_USD"
-        df = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 1, 0, 2, tzinfo=UTC),
-                datetime(2024, 1, 1, 0, 1, tzinfo=UTC),
-                datetime(2024, 1, 2, 0, 0, tzinfo=UTC),
-            ],
-            "value": [1.0, 2.0, 3.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 1, 0, 2, tzinfo=UTC),
+                    datetime(2024, 1, 1, 0, 1, tzinfo=UTC),
+                    datetime(2024, 1, 2, 0, 0, tzinfo=UTC),
+                ],
+                "value": [1.0, 2.0, 3.0],
+            }
+        )
         store.write(key, df)
         batches = list(
             store.read(
@@ -1038,7 +1090,9 @@ class TestParquetStoreCoverage:
         assert len(batches) == 1
         assert batches[0]["timestamp"].to_list() == sorted(batches[0]["timestamp"].to_list())
 
-    def test_read_batched_skips_empty_batches(self, temp_storage_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_read_batched_skips_empty_batches(
+        self, temp_storage_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         store = ParquetStore(str(temp_storage_path))
 
         class FakeScanner:
@@ -1055,11 +1109,11 @@ class TestParquetStoreCoverage:
             def scanner(self, _columns=None, _filter=None, _batch_size=None) -> FakeScanner:  # noqa: ANN001
                 return FakeScanner()
 
-        monkeypatch.setattr(
-            parquet_module.ds, "dataset", lambda *_args, **_kwargs: FakeDataset()
-        )
+        monkeypatch.setattr(parquet_module.ds, "dataset", lambda *_args, **_kwargs: FakeDataset())
 
-        batches = list(store._read_batched([temp_storage_path / "fake.parquet"], None, None, None, 10))
+        batches = list(
+            store._read_batched([temp_storage_path / "fake.parquet"], None, None, None, 10)
+        )
         assert batches == []
 
     def test_list_keys_ignores_partition_only_paths(self, temp_storage_path: Path) -> None:
@@ -1073,12 +1127,14 @@ class TestParquetStoreCoverage:
         store = ParquetStore(str(temp_storage_path))
         key_path = temp_storage_path / "forex" / "EUR_USD"
         key_path.mkdir(parents=True)
-        df = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 1, tzinfo=UTC),
-                datetime(2024, 1, 3, tzinfo=UTC),
-            ]
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 1, tzinfo=UTC),
+                    datetime(2024, 1, 3, tzinfo=UTC),
+                ]
+            }
+        )
         df.write_parquet(key_path / "data.parquet")
         result = store.get_date_range("forex/EUR_USD")
         assert result == (date(2024, 1, 1), date(2024, 1, 3))
@@ -1087,21 +1143,27 @@ class TestParquetStoreCoverage:
         store = ParquetStore(str(temp_storage_path))
         key_path = temp_storage_path / "forex" / "EUR_USD"
         key_path.mkdir(parents=True)
-        pl.DataFrame({"timestamp": [datetime(2024, 1, 1, tzinfo=UTC)]}).write_parquet(key_path / "data.parquet")
+        pl.DataFrame({"timestamp": [datetime(2024, 1, 1, tzinfo=UTC)]}).write_parquet(
+            key_path / "data.parquet"
+        )
 
-        with patch("liq.store.parquet.pl.read_parquet", side_effect=pl.exceptions.PolarsError("bad")):
+        with patch(
+            "liq.store.parquet.pl.read_parquet", side_effect=pl.exceptions.PolarsError("bad")
+        ):
             assert store.get_date_range("forex/EUR_USD") is None
 
     def test_consolidate_overrides_and_restores_config(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         key = "forex/EUR_USD"
-        df = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 1, tzinfo=UTC),
-                datetime(2024, 1, 2, tzinfo=UTC),
-            ],
-            "value": [1.0, 2.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 1, tzinfo=UTC),
+                    datetime(2024, 1, 2, tzinfo=UTC),
+                ],
+                "value": [1.0, 2.0],
+            }
+        )
         store.write(key, df)
         original_target = store.config.target_rows_per_file
         result = store.consolidate(key, target_rows_per_file=1)

@@ -17,21 +17,21 @@ from liq.store.parquet import ParquetStore
 class TestTimestampUTCEnforcement:
     """Tests verifying UTC timezone handling in storage operations."""
 
-    def test_read_filter_uses_utc_for_start_date(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_read_filter_uses_utc_for_start_date(self, temp_storage_path: Path) -> None:
         """Date filter for start should use UTC midnight."""
         store = ParquetStore(str(temp_storage_path))
 
         # Create data with specific UTC timestamps
-        df = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 15, 0, 0, 0, tzinfo=UTC),   # Midnight UTC
-                datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC),  # Noon UTC
-                datetime(2024, 1, 16, 0, 0, 0, tzinfo=UTC),   # Next day midnight UTC
-            ],
-            "value": [1.0, 2.0, 3.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 15, 0, 0, 0, tzinfo=UTC),  # Midnight UTC
+                    datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC),  # Noon UTC
+                    datetime(2024, 1, 16, 0, 0, 0, tzinfo=UTC),  # Next day midnight UTC
+                ],
+                "value": [1.0, 2.0, 3.0],
+            }
+        )
         store.write("test/utc", df)
 
         # Filter for date 2024-01-15 should include both midnight and noon
@@ -42,21 +42,21 @@ class TestTimestampUTCEnforcement:
         assert timestamps[0] == datetime(2024, 1, 15, 0, 0, 0, tzinfo=UTC)
         assert timestamps[1] == datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)
 
-    def test_read_filter_end_includes_full_day(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_read_filter_end_includes_full_day(self, temp_storage_path: Path) -> None:
         """End date filter should include data up to end of day UTC."""
         store = ParquetStore(str(temp_storage_path))
 
         # Create data with timestamps spanning multiple days
-        df = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 15, 0, 0, 0, tzinfo=UTC),
-                datetime(2024, 1, 15, 23, 59, 59, tzinfo=UTC),  # End of day
-                datetime(2024, 1, 16, 0, 0, 1, tzinfo=UTC),     # Just past midnight
-            ],
-            "value": [1.0, 2.0, 3.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 15, 0, 0, 0, tzinfo=UTC),
+                    datetime(2024, 1, 15, 23, 59, 59, tzinfo=UTC),  # End of day
+                    datetime(2024, 1, 16, 0, 0, 1, tzinfo=UTC),  # Just past midnight
+                ],
+                "value": [1.0, 2.0, 3.0],
+            }
+        )
         store.write("test/eod", df)
 
         # End date Jan 15 should include 23:59:59 but not 00:00:01 of Jan 16
@@ -64,20 +64,20 @@ class TestTimestampUTCEnforcement:
 
         assert len(result) == 2
 
-    def test_date_range_returns_utc_dates(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_date_range_returns_utc_dates(self, temp_storage_path: Path) -> None:
         """get_date_range should return dates in UTC context."""
         store = ParquetStore(str(temp_storage_path))
 
         # Store data with UTC timestamps
-        df = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 15, 0, 0, 0, tzinfo=UTC),
-                datetime(2024, 1, 20, 23, 59, 59, tzinfo=UTC),
-            ],
-            "value": [1.0, 2.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 15, 0, 0, 0, tzinfo=UTC),
+                    datetime(2024, 1, 20, 23, 59, 59, tzinfo=UTC),
+                ],
+                "value": [1.0, 2.0],
+            }
+        )
         store.write("test/range", df)
 
         result = store.get_date_range("test/range")
@@ -133,21 +133,21 @@ class TestFilenameTimestampParsing:
 class TestTimestampSortingOnWrite:
     """Tests verifying data is sorted by timestamp on write."""
 
-    def test_write_sorts_by_timestamp(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_write_sorts_by_timestamp(self, temp_storage_path: Path) -> None:
         """Data should be sorted by timestamp after write."""
         store = ParquetStore(str(temp_storage_path))
 
         # Write out-of-order data
-        df = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC),  # Middle
-                datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC),   # First
-                datetime(2024, 1, 15, 16, 0, 0, tzinfo=UTC),  # Last
-            ],
-            "value": [2.0, 1.0, 3.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC),  # Middle
+                    datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC),  # First
+                    datetime(2024, 1, 15, 16, 0, 0, tzinfo=UTC),  # Last
+                ],
+                "value": [2.0, 1.0, 3.0],
+            }
+        )
         store.write("test/sort", df)
 
         result = store.read("test/sort")
@@ -158,30 +158,32 @@ class TestTimestampSortingOnWrite:
         assert timestamps[0] == datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC)
         assert timestamps[2] == datetime(2024, 1, 15, 16, 0, 0, tzinfo=UTC)
 
-    def test_append_maintains_sorted_order(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_append_maintains_sorted_order(self, temp_storage_path: Path) -> None:
         """Appended data should be merged and sorted."""
         store = ParquetStore(str(temp_storage_path))
 
         # Write initial data
-        df1 = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
-                datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC),
-            ],
-            "value": [1.0, 2.0],
-        })
+        df1 = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
+                    datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC),
+                ],
+                "value": [1.0, 2.0],
+            }
+        )
         store.write("test/append", df1)
 
         # Append data that should interleave
-        df2 = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC),   # Before existing
-                datetime(2024, 1, 15, 11, 0, 0, tzinfo=UTC),  # Between existing
-            ],
-            "value": [0.0, 1.5],
-        })
+        df2 = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC),  # Before existing
+                    datetime(2024, 1, 15, 11, 0, 0, tzinfo=UTC),  # Between existing
+                ],
+                "value": [0.0, 1.5],
+            }
+        )
         store.write("test/append", df2, mode="append")
 
         result = store.read("test/append")
@@ -195,26 +197,28 @@ class TestTimestampSortingOnWrite:
 class TestDeduplicationBehavior:
     """Tests verifying timestamp-based deduplication."""
 
-    def test_append_deduplicates_by_timestamp(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_append_deduplicates_by_timestamp(self, temp_storage_path: Path) -> None:
         """Duplicate timestamps should keep last value."""
         store = ParquetStore(str(temp_storage_path))
 
         ts = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
 
         # Write initial data
-        df1 = pl.DataFrame({
-            "timestamp": [ts],
-            "value": [1.0],
-        })
+        df1 = pl.DataFrame(
+            {
+                "timestamp": [ts],
+                "value": [1.0],
+            }
+        )
         store.write("test/dedup", df1)
 
         # Append same timestamp with different value
-        df2 = pl.DataFrame({
-            "timestamp": [ts],
-            "value": [2.0],  # New value for same timestamp
-        })
+        df2 = pl.DataFrame(
+            {
+                "timestamp": [ts],
+                "value": [2.0],  # New value for same timestamp
+            }
+        )
         store.write("test/dedup", df2, mode="append")
 
         result = store.read("test/dedup")
@@ -224,27 +228,29 @@ class TestDeduplicationBehavior:
         # Should keep last value
         assert result["value"][0] == 2.0
 
-    def test_overwrite_does_not_merge_with_existing(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_overwrite_does_not_merge_with_existing(self, temp_storage_path: Path) -> None:
         """Overwrite mode should replace, not merge."""
         store = ParquetStore(str(temp_storage_path))
 
         # Write initial data
-        df1 = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
-                datetime(2024, 1, 15, 11, 0, 0, tzinfo=UTC),
-            ],
-            "value": [1.0, 2.0],
-        })
+        df1 = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
+                    datetime(2024, 1, 15, 11, 0, 0, tzinfo=UTC),
+                ],
+                "value": [1.0, 2.0],
+            }
+        )
         store.write("test/overwrite", df1)
 
         # Overwrite with single row
-        df2 = pl.DataFrame({
-            "timestamp": [datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)],
-            "value": [3.0],
-        })
+        df2 = pl.DataFrame(
+            {
+                "timestamp": [datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC)],
+                "value": [3.0],
+            }
+        )
         store.write("test/overwrite", df2, mode="overwrite")
 
         result = store.read("test/overwrite")
@@ -257,16 +263,16 @@ class TestDeduplicationBehavior:
 class TestTimestampColumnHandling:
     """Tests for handling of timestamp columns."""
 
-    def test_no_timestamp_column_skips_sorting(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_no_timestamp_column_skips_sorting(self, temp_storage_path: Path) -> None:
         """Data without timestamp column should be stored as-is."""
         store = ParquetStore(str(temp_storage_path))
 
-        df = pl.DataFrame({
-            "id": [3, 1, 2],
-            "value": [30.0, 10.0, 20.0],
-        })
+        df = pl.DataFrame(
+            {
+                "id": [3, 1, 2],
+                "value": [30.0, 10.0, 20.0],
+            }
+        )
         store.write("test/no_ts", df)
 
         result = store.read("test/no_ts")
@@ -274,24 +280,20 @@ class TestTimestampColumnHandling:
         # Order should be preserved (no timestamp sorting)
         assert result["id"].to_list() == [3, 1, 2]
 
-    def test_no_timestamp_column_skips_date_filter(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_no_timestamp_column_skips_date_filter(self, temp_storage_path: Path) -> None:
         """Date filters should be ignored for data without timestamp."""
         store = ParquetStore(str(temp_storage_path))
 
-        df = pl.DataFrame({
-            "id": [1, 2, 3],
-            "value": [10.0, 20.0, 30.0],
-        })
+        df = pl.DataFrame(
+            {
+                "id": [1, 2, 3],
+                "value": [10.0, 20.0, 30.0],
+            }
+        )
         store.write("test/no_ts_filter", df)
 
         # Date filters should have no effect
-        result = store.read(
-            "test/no_ts_filter",
-            start=date(2024, 1, 1),
-            end=date(2024, 12, 31)
-        )
+        result = store.read("test/no_ts_filter", start=date(2024, 1, 1), end=date(2024, 12, 31))
 
         assert len(result) == 3
 
@@ -299,17 +301,17 @@ class TestTimestampColumnHandling:
 class TestTimestampPrecision:
     """Tests for timestamp precision preservation."""
 
-    def test_microsecond_precision_preserved(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_microsecond_precision_preserved(self, temp_storage_path: Path) -> None:
         """Microsecond precision should be preserved in storage."""
         store = ParquetStore(str(temp_storage_path))
 
         ts_with_micros = datetime(2024, 1, 15, 10, 30, 45, 123456, tzinfo=UTC)
-        df = pl.DataFrame({
-            "timestamp": [ts_with_micros],
-            "value": [1.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [ts_with_micros],
+                "value": [1.0],
+            }
+        )
         store.write("test/precision", df)
 
         result = store.read("test/precision")
@@ -319,20 +321,19 @@ class TestTimestampPrecision:
         stored_ts = result["timestamp"][0]
         assert stored_ts.microsecond == 123456
 
-    def test_nanosecond_truncated_to_microsecond(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_nanosecond_truncated_to_microsecond(self, temp_storage_path: Path) -> None:
         """Nanosecond precision may be truncated to microsecond."""
         store = ParquetStore(str(temp_storage_path))
 
         # Polars supports nanosecond precision
-        df = pl.DataFrame({
-            "timestamp": pl.Series(
-                [datetime(2024, 1, 15, 10, 30, 45, tzinfo=UTC)],
-                dtype=pl.Datetime("ns", "UTC")
-            ),
-            "value": [1.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": pl.Series(
+                    [datetime(2024, 1, 15, 10, 30, 45, tzinfo=UTC)], dtype=pl.Datetime("ns", "UTC")
+                ),
+                "value": [1.0],
+            }
+        )
         store.write("test/nano", df)
 
         result = store.read("test/nano")
@@ -345,9 +346,7 @@ class TestTimestampPrecision:
 class TestChunkedWriteTimestamps:
     """Tests for chunked write timestamp handling."""
 
-    def test_chunk_filenames_reflect_timestamp_range(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_chunk_filenames_reflect_timestamp_range(self, temp_storage_path: Path) -> None:
         """Chunk filenames should contain correct timestamp ranges."""
         from liq.store.parquet import ParquetStoreConfig
 
@@ -356,14 +355,13 @@ class TestChunkedWriteTimestamps:
         store = ParquetStore(str(temp_storage_path), config=config)
 
         # Create data with 5 rows
-        timestamps = [
-            datetime(2024, 1, 15, i, 0, 0, tzinfo=UTC)
-            for i in range(5)
-        ]
-        df = pl.DataFrame({
-            "timestamp": timestamps,
-            "value": list(range(5)),
-        })
+        timestamps = [datetime(2024, 1, 15, i, 0, 0, tzinfo=UTC) for i in range(5)]
+        df = pl.DataFrame(
+            {
+                "timestamp": timestamps,
+                "value": list(range(5)),
+            }
+        )
         store.write("test/chunks", df)
 
         # Check that multiple parquet files were created
@@ -386,9 +384,7 @@ class TestChunkedWriteTimestamps:
 class TestEmptyDataframeDateRange:
     """Tests for edge cases with empty data."""
 
-    def test_empty_dataframe_date_range_returns_none(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_empty_dataframe_date_range_returns_none(self, temp_storage_path: Path) -> None:
         """Empty DataFrame should return None for date range."""
         store = ParquetStore(str(temp_storage_path))
 
@@ -398,9 +394,7 @@ class TestEmptyDataframeDateRange:
 
         assert result is None
 
-    def test_read_empty_returns_empty_dataframe(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_read_empty_returns_empty_dataframe(self, temp_storage_path: Path) -> None:
         """Reading nonexistent key should return empty DataFrame."""
         store = ParquetStore(str(temp_storage_path))
 
@@ -413,17 +407,17 @@ class TestEmptyDataframeDateRange:
 class TestTimezoneAwareDataIntegrity:
     """Tests ensuring timezone awareness is maintained throughout."""
 
-    def test_utc_timestamps_preserved_through_roundtrip(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_utc_timestamps_preserved_through_roundtrip(self, temp_storage_path: Path) -> None:
         """UTC timestamps should be preserved through write/read."""
         store = ParquetStore(str(temp_storage_path))
 
         original_ts = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
-        df = pl.DataFrame({
-            "timestamp": [original_ts],
-            "value": [1.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [original_ts],
+                "value": [1.0],
+            }
+        )
         store.write("test/utc_roundtrip", df)
 
         result = store.read("test/utc_roundtrip")
@@ -432,29 +426,25 @@ class TestTimezoneAwareDataIntegrity:
         # Verify timezone is preserved
         assert result["timestamp"].dtype.time_zone == "UTC"
 
-    def test_filter_date_boundaries_are_inclusive(
-        self, temp_storage_path: Path
-    ) -> None:
+    def test_filter_date_boundaries_are_inclusive(self, temp_storage_path: Path) -> None:
         """Both start and end dates should be inclusive."""
         store = ParquetStore(str(temp_storage_path))
 
         # Create data spanning 3 days
-        df = pl.DataFrame({
-            "timestamp": [
-                datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC),
-                datetime(2024, 1, 16, 12, 0, 0, tzinfo=UTC),
-                datetime(2024, 1, 17, 12, 0, 0, tzinfo=UTC),
-            ],
-            "value": [1.0, 2.0, 3.0],
-        })
+        df = pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 15, 12, 0, 0, tzinfo=UTC),
+                    datetime(2024, 1, 16, 12, 0, 0, tzinfo=UTC),
+                    datetime(2024, 1, 17, 12, 0, 0, tzinfo=UTC),
+                ],
+                "value": [1.0, 2.0, 3.0],
+            }
+        )
         store.write("test/inclusive", df)
 
         # Filter for middle day only
-        result = store.read(
-            "test/inclusive",
-            start=date(2024, 1, 16),
-            end=date(2024, 1, 16)
-        )
+        result = store.read("test/inclusive", start=date(2024, 1, 16), end=date(2024, 1, 16))
 
         assert len(result) == 1
         assert result["value"][0] == 2.0

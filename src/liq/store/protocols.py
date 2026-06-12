@@ -52,9 +52,7 @@ class TimeSeriesStore(Protocol):
         """
         ...
 
-    def read(
-        self, key: str, start: date | None = None, end: date | None = None
-    ) -> pl.DataFrame:
+    def read(self, key: str, start: date | None = None, end: date | None = None) -> pl.DataFrame:
         """Read time-series data from storage.
 
         Args:

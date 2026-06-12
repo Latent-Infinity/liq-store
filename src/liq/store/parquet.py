@@ -274,9 +274,7 @@ class ParquetStore:
 
         return existing_is_numeric and new_is_numeric
 
-    def _merge_and_dedupe(
-        self, existing: pl.DataFrame, new: pl.DataFrame
-    ) -> pl.DataFrame:
+    def _merge_and_dedupe(self, existing: pl.DataFrame, new: pl.DataFrame) -> pl.DataFrame:
         """Merge existing and new data with deduplication.
 
         Args:
@@ -340,9 +338,7 @@ class ParquetStore:
                         first_existing = next(key_path.rglob("*.parquet"), None)
                         if first_existing:
                             existing_df = pl.read_parquet(first_existing)
-                            self._check_schema_compatibility(
-                                existing_df.schema, data.schema
-                            )
+                            self._check_schema_compatibility(existing_df.schema, data.schema)
 
                     # Determine partitions from data
                     if "timestamp" in data.columns:
@@ -381,9 +377,7 @@ class ParquetStore:
                                         continue
                                     if (year_int, month_int) in touched_partitions:
                                         continue
-                                    dest_dir = (
-                                        temp_path / year_dir.name / month_dir.name
-                                    )
+                                    dest_dir = temp_path / year_dir.name / month_dir.name
                                     dest_dir.parent.mkdir(parents=True, exist_ok=True)
                                     shutil.copytree(month_dir, dest_dir)
                         else:
@@ -398,18 +392,14 @@ class ParquetStore:
                             part_df = part.drop(["_year", "_month"])
                             part_dest = temp_path / f"year={year}" / f"month={month:02d}"
                             existing_df = pl.DataFrame()
-                            existing_path = (
-                                key_path / f"year={year}" / f"month={month:02d}"
-                            )
-                            if mode != "overwrite" and existing_path.exists() and any(
-                                existing_path.glob("*.parquet")
+                            existing_path = key_path / f"year={year}" / f"month={month:02d}"
+                            if (
+                                mode != "overwrite"
+                                and existing_path.exists()
+                                and any(existing_path.glob("*.parquet"))
                             ):
-                                existing_df = pl.read_parquet(
-                                    existing_path / "*.parquet"
-                                )
-                                self._check_schema_compatibility(
-                                    existing_df.schema, part_df.schema
-                                )
+                                existing_df = pl.read_parquet(existing_path / "*.parquet")
+                                self._check_schema_compatibility(existing_df.schema, part_df.schema)
                             merged = self._merge_and_dedupe(existing_df, part_df)
                             if "timestamp" in merged.columns:
                                 merged = merged.sort("timestamp")
@@ -421,9 +411,7 @@ class ParquetStore:
                             existing_glob = list(key_path.glob("*.parquet"))
                             if existing_glob:
                                 existing_df = pl.read_parquet(existing_glob)
-                                self._check_schema_compatibility(
-                                    existing_df.schema, data.schema
-                                )
+                                self._check_schema_compatibility(existing_df.schema, data.schema)
                         merged = self._merge_and_dedupe(existing_df, data)
                         self._write_chunked(merged, temp_path)
 
@@ -523,8 +511,7 @@ class ParquetStore:
         *,
         streaming: bool = False,
         batch_size: None = None,
-    ) -> pl.DataFrame:
-        ...
+    ) -> pl.DataFrame: ...
 
     @overload
     def read(
@@ -536,8 +523,7 @@ class ParquetStore:
         *,
         streaming: bool = False,
         batch_size: int,
-    ) -> Iterator[pl.DataFrame]:
-        ...
+    ) -> Iterator[pl.DataFrame]: ...
 
     def read(
         self,
@@ -854,9 +840,7 @@ class ParquetStore:
         except pl.exceptions.PolarsError:
             return None
 
-    def consolidate(
-        self, key: str, target_rows_per_file: int | None = None
-    ) -> dict[str, int]:
+    def consolidate(self, key: str, target_rows_per_file: int | None = None) -> dict[str, int]:
         """Consolidate parquet files for a key into larger chunks.
 
         Args:

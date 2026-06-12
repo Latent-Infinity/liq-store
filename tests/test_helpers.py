@@ -13,11 +13,13 @@ def test_get_gaps_detects_missing_intervals(temp_storage_path: Path) -> None:
     ts0 = datetime(2024, 1, 1, 10, 0, tzinfo=UTC)
     ts1 = datetime(2024, 1, 1, 11, 0, tzinfo=UTC)
     ts3 = datetime(2024, 1, 1, 13, 0, tzinfo=UTC)  # gap at 12:00
-    df = pl.DataFrame({
-        "timestamp": [ts0, ts1, ts3],
-        "symbol": ["EUR_USD"] * 3,
-        "value": [1.0, 2.0, 4.0],
-    })
+    df = pl.DataFrame(
+        {
+            "timestamp": [ts0, ts1, ts3],
+            "symbol": ["EUR_USD"] * 3,
+            "value": [1.0, 2.0, 4.0],
+        }
+    )
     store.write("forex/EUR_USD", df)
 
     gaps = store.get_gaps(
@@ -35,10 +37,12 @@ def test_get_gaps_detects_missing_intervals(temp_storage_path: Path) -> None:
 def test_get_gaps_no_gaps_returns_empty(temp_storage_path: Path) -> None:
     store = ParquetStore(str(temp_storage_path))
     ts0 = datetime(2024, 1, 1, 10, 0, tzinfo=UTC)
-    df = pl.DataFrame({
-        "timestamp": [ts0, ts0 + timedelta(hours=1)],
-        "value": [1.0, 2.0],
-    })
+    df = pl.DataFrame(
+        {
+            "timestamp": [ts0, ts0 + timedelta(hours=1)],
+            "value": [1.0, 2.0],
+        }
+    )
     store.write("test/no_gaps", df)
 
     gaps = store.get_gaps(
@@ -59,7 +63,9 @@ def test_get_gaps_head_and_tail(temp_storage_path: Path) -> None:
 
     start = datetime(2024, 1, 2, 10, 0, tzinfo=UTC)
     end = datetime(2024, 1, 2, 15, 0, tzinfo=UTC)
-    gaps = store.get_gaps("test/head_tail", start=start, end=end, expected_interval=timedelta(hours=1))
+    gaps = store.get_gaps(
+        "test/head_tail", start=start, end=end, expected_interval=timedelta(hours=1)
+    )
     # Expect gap before first and after last
     assert gaps[0][0] == start
     assert gaps[-1][0] == datetime(2024, 1, 2, 14, 0, tzinfo=UTC)
@@ -75,10 +81,12 @@ def test_consolidate_reduces_file_count(temp_storage_path: Path) -> None:
         lock_timeout_seconds=store.config.lock_timeout_seconds,
     )
     ts0 = datetime(2024, 1, 1, 0, 0, tzinfo=UTC)
-    df = pl.DataFrame({
-        "timestamp": [ts0 + timedelta(minutes=i) for i in range(5)],
-        "value": list(range(5)),
-    })
+    df = pl.DataFrame(
+        {
+            "timestamp": [ts0 + timedelta(minutes=i) for i in range(5)],
+            "value": list(range(5)),
+        }
+    )
     store.write("test/chunks", df)
     files_before = len(list((temp_storage_path / "test" / "chunks").rglob("*.parquet")))
 
