@@ -4,7 +4,8 @@ This module defines the Protocol-based interfaces for storage backends.
 Using Protocol instead of ABC enables structural subtyping (duck typing).
 """
 
-from datetime import date
+from collections.abc import Sequence
+from datetime import date, datetime
 from typing import Protocol, runtime_checkable
 
 import polars as pl
@@ -127,5 +128,38 @@ class TimeSeriesStore(Protocol):
 
         Returns:
             Tuple of (earliest_date, latest_date) or None if no data
+        """
+        ...
+
+    def read_multi(
+        self,
+        keys: Sequence[str],
+        start: datetime,
+        end: datetime,
+        *,
+        columns: Sequence[str] | None = None,
+    ) -> pl.DataFrame:
+        """Read one time window across N keys in a single call.
+
+        Returns long-format with a ``symbol`` column populated from
+        the key. The half-open window ``[start, end)`` is applied
+        identically to every key. Keys with no data for the window
+        contribute no rows — missing keys are not an error (loud
+        failure is the caller's job, not the store's).
+
+        Args:
+            keys: Storage keys to read; each must address a bar/time-
+                series partition. The symbol is derived from the
+                segment immediately preceding ``bars`` in each key
+                (e.g., ``"databento/AAPL/bars/1m" → "AAPL"``).
+            start: Inclusive lower bound on ``timestamp``.
+            end: Exclusive upper bound on ``timestamp``.
+            columns: Optional column subset (excluding ``symbol``;
+                always included in the output).
+
+        Returns:
+            Long-format ``pl.DataFrame`` with the selected columns +
+            ``symbol``. Empty DataFrame if every key is missing or
+            yields no rows in the window.
         """
         ...

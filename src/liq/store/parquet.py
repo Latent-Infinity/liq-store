@@ -22,7 +22,7 @@ import fcntl
 import logging
 import os
 import shutil
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast, overload
 from uuid import uuid4
 
+import duckdb
 import polars as pl
 import pyarrow.dataset as ds
 
@@ -40,6 +41,7 @@ from liq.store.exceptions import (
     SchemaCompatibilityError,
     StorageError,
 )
+from liq.store.key_layout import partition_files, symbol_from_bar_key, use_month_partitions
 from liq.store.naming import generate_filename, parse_filename
 
 if TYPE_CHECKING:
@@ -340,16 +342,20 @@ class ParquetStore:
                             existing_df = pl.read_parquet(first_existing)
                             self._check_schema_compatibility(existing_df.schema, data.schema)
 
-                    # Determine partitions from data
+                    month_partitions = use_month_partitions(key)
+
+                    # Determine partitions from data. 1m bars and
+                    # historical non-bar time series use year/month;
+                    # coarser bar keys stay yearly per the scanner plan.
                     if "timestamp" in data.columns:
-                        data_with_parts = data.with_columns(
-                            [
-                                pl.col("timestamp").dt.year().alias("_year"),
-                                pl.col("timestamp").dt.month().alias("_month"),
-                            ]
-                        )
+                        partition_exprs = [pl.col("timestamp").dt.year().alias("_year")]
+                        partition_cols = ["_year"]
+                        if month_partitions:
+                            partition_exprs.append(pl.col("timestamp").dt.month().alias("_month"))
+                            partition_cols.append("_month")
+                        data_with_parts = data.with_columns(partition_exprs)
                         partitions = data_with_parts.partition_by(
-                            ["_year", "_month"], maintain_order=True
+                            partition_cols, maintain_order=True
                         )
                     else:
                         partitions = [data]
@@ -358,7 +364,7 @@ class ParquetStore:
                     if "timestamp" in data.columns:
                         for part in partitions:
                             year = int(part["_year"][0])
-                            month = int(part["_month"][0])
+                            month = int(part["_month"][0]) if month_partitions else None
                             touched_partitions.add((year, month))
                     else:
                         touched_partitions.add((None, None))
@@ -368,18 +374,34 @@ class ParquetStore:
                         if "timestamp" in data.columns:
                             for year_dir in key_path.glob("year=*"):
                                 year_value = year_dir.name.replace("year=", "")
-                                for month_dir in year_dir.glob("month=*"):
-                                    month_value = month_dir.name.replace("month=", "")
-                                    try:
-                                        year_int = int(year_value)
-                                        month_int = int(month_value)
-                                    except ValueError:
+                                try:
+                                    year_int = int(year_value)
+                                except ValueError:
+                                    continue
+                                if month_partitions:
+                                    direct_files = list(year_dir.glob("*.parquet"))
+                                    if direct_files:
+                                        dest_year = temp_path / year_dir.name
+                                        dest_year.mkdir(parents=True, exist_ok=True)
+                                        for parquet_file in direct_files:
+                                            shutil.copy2(
+                                                parquet_file, dest_year / parquet_file.name
+                                            )
+                                    for month_dir in year_dir.glob("month=*"):
+                                        month_value = month_dir.name.replace("month=", "")
+                                        try:
+                                            month_int = int(month_value)
+                                        except ValueError:
+                                            continue
+                                        if (year_int, month_int) in touched_partitions:
+                                            continue
+                                        dest_dir = temp_path / year_dir.name / month_dir.name
+                                        dest_dir.parent.mkdir(parents=True, exist_ok=True)
+                                        shutil.copytree(month_dir, dest_dir)
+                                else:
+                                    if (year_int, None) in touched_partitions:
                                         continue
-                                    if (year_int, month_int) in touched_partitions:
-                                        continue
-                                    dest_dir = temp_path / year_dir.name / month_dir.name
-                                    dest_dir.parent.mkdir(parents=True, exist_ok=True)
-                                    shutil.copytree(month_dir, dest_dir)
+                                    shutil.copytree(year_dir, temp_path / year_dir.name)
                         else:
                             # No timestamp partitioning; copy everything
                             shutil.copytree(key_path, temp_path, dirs_exist_ok=True)
@@ -388,17 +410,27 @@ class ParquetStore:
                     if "timestamp" in data.columns:
                         for part in partitions:
                             year = int(part["_year"][0])
-                            month = int(part["_month"][0])
-                            part_df = part.drop(["_year", "_month"])
-                            part_dest = temp_path / f"year={year}" / f"month={month:02d}"
+                            month = int(part["_month"][0]) if month_partitions else None
+                            drop_cols = ["_year", "_month"] if month_partitions else ["_year"]
+                            part_df = part.drop(drop_cols)
+                            part_dest = (
+                                temp_path / f"year={year}" / f"month={month:02d}"
+                                if month_partitions and month is not None
+                                else temp_path / f"year={year}"
+                            )
                             existing_df = pl.DataFrame()
-                            existing_path = key_path / f"year={year}" / f"month={month:02d}"
-                            if (
-                                mode != "overwrite"
-                                and existing_path.exists()
-                                and any(existing_path.glob("*.parquet"))
-                            ):
-                                existing_df = pl.read_parquet(existing_path / "*.parquet")
+                            existing_path = (
+                                key_path / f"year={year}" / f"month={month:02d}"
+                                if month_partitions and month is not None
+                                else key_path / f"year={year}"
+                            )
+                            existing_files = (
+                                list(existing_path.glob("*.parquet"))
+                                if month_partitions
+                                else list(existing_path.rglob("*.parquet"))
+                            )
+                            if mode != "overwrite" and existing_files:
+                                existing_df = pl.read_parquet(existing_files)
                                 self._check_schema_compatibility(existing_df.schema, part_df.schema)
                             merged = self._merge_and_dedupe(existing_df, part_df)
                             if "timestamp" in merged.columns:
@@ -722,6 +754,73 @@ class ParquetStore:
             if "timestamp" in df.columns:
                 df = df.sort("timestamp")
             yield df
+
+    def read_multi(
+        self,
+        keys: Sequence[str],
+        start: datetime,
+        end: datetime,
+        *,
+        columns: Sequence[str] | None = None,
+    ) -> pl.DataFrame:
+        """Read one time window across N bar keys in a single call.
+
+        Implemented as one DuckDB ``read_parquet`` scan over the file
+        list, joined to a temporary filename-to-symbol table. Missing
+        keys (no parquet files on disk) contribute zero rows but never
+        raise; loud failure on missing coverage is the scanner's job,
+        not the store's.
+
+        Both the current 1m ``year=YYYY/month=MM/`` layout and
+        ``year=YYYY/`` files are read in one shot via
+        :func:`liq.store.key_layout.partition_files`, so callers do not
+        need to migrate before sweeping.
+        """
+        if not keys:
+            return pl.DataFrame()
+
+        # Resolve symbols up-front so an invalid key fails fast (per
+        # ``symbol_from_bar_key`` contract) rather than partway through
+        # the union build.
+        symbol_by_key = {k: symbol_from_bar_key(k) for k in keys}
+
+        file_symbols: list[tuple[str, str]] = []
+        for k in keys:
+            files = partition_files(self._key_to_path(k))
+            file_symbols.extend((path, symbol_by_key[k]) for path in files)
+        if not file_symbols:
+            return pl.DataFrame()
+
+        select_cols = list(columns) if columns else None
+        select_list = (
+            ", ".join(f'p."{c}"' for c in select_cols) if select_cols else "p.* EXCLUDE (filename)"
+        )
+        all_files = [path for path, _symbol in file_symbols]
+
+        conn = duckdb.connect(database=":memory:")
+        try:
+            conn.execute("CREATE TEMP TABLE file_symbols(filename VARCHAR, symbol VARCHAR)")
+            conn.executemany(
+                "INSERT INTO file_symbols VALUES (?, ?)",
+                file_symbols,
+            )
+            sql = (
+                f"SELECT {select_list}, m.symbol AS symbol "
+                "FROM read_parquet(?, hive_partitioning=false, union_by_name=true, "
+                "filename=true) AS p "
+                "JOIN file_symbols AS m ON p.filename = m.filename "
+                "WHERE p.timestamp >= ? AND p.timestamp < ?"
+            )
+            arrow_table = conn.execute(sql, [all_files, start, end]).arrow()
+        finally:
+            conn.close()
+
+        df = cast(pl.DataFrame, pl.from_arrow(arrow_table))
+        if df.is_empty():
+            return df
+        if "timestamp" in df.columns:
+            df = df.sort(["symbol", "timestamp"])
+        return df
 
     def exists(self, key: str) -> bool:
         """Check if data exists for a key.

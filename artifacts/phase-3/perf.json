@@ -1,0 +1,31 @@
+{
+  "date": "2026-06-12",
+  "benchmark": "ParquetStore.read_multi",
+  "window": "1_session",
+  "warmup_runs": 2,
+  "timed_runs": 10,
+  "commands": [
+    "uv run pytest tests/perf/test_read_multi.py::test_read_multi_500_symbols_under_1s -m perf -q --no-cov -s",
+    "RUN_LARGE_PERF=1 uv run pytest tests/perf/test_read_multi.py::test_read_multi_5000_symbols_under_5s -m perf -q --no-cov -s"
+  ],
+  "results": [
+    {
+      "symbols": 500,
+      "budget_s": 1.0,
+      "p50": 0.15384002099744976,
+      "p95": 0.15466954099247232,
+      "min": 0.1506642919848673,
+      "max": 0.15481537498999387,
+      "status": "pass"
+    },
+    {
+      "symbols": 5000,
+      "budget_s": 5.0,
+      "p50": 1.5694166875327937,
+      "p95": 1.6118233330198564,
+      "min": 1.5616686660214327,
+      "max": 1.6642352079506963,
+      "status": "pass"
+    }
+  ]
+}

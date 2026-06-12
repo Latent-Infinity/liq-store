@@ -462,6 +462,44 @@ class TestParquetStoreWrite:
         parquet_files = list(month_dir.glob("*.parquet"))
         assert parquet_files, "Partitioned parquet files should be created"
 
+    def test_write_1m_bar_key_uses_month_partition(
+        self, temp_storage_path: Path, sample_timestamp: datetime
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        df = pl.DataFrame({"timestamp": [sample_timestamp], "close": [100.0]})
+
+        store.write("databento/SPY/bars/1m", df)
+
+        month_dir = (
+            temp_storage_path
+            / "databento"
+            / "SPY"
+            / "bars"
+            / "1m"
+            / f"year={sample_timestamp.year}"
+            / f"month={sample_timestamp.month:02d}"
+        )
+        assert list(month_dir.glob("*.parquet"))
+
+    def test_write_daily_bar_key_stays_yearly(
+        self, temp_storage_path: Path, sample_timestamp: datetime
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        df = pl.DataFrame({"timestamp": [sample_timestamp], "close": [100.0]})
+
+        store.write("databento/SPY/bars/1d", df)
+
+        year_dir = (
+            temp_storage_path
+            / "databento"
+            / "SPY"
+            / "bars"
+            / "1d"
+            / f"year={sample_timestamp.year}"
+        )
+        assert list(year_dir.glob("*.parquet"))
+        assert not (year_dir / f"month={sample_timestamp.month:02d}").exists()
+
     def test_write_empty_dataframe(self, temp_storage_path: Path) -> None:
         store = ParquetStore(str(temp_storage_path))
         empty_df = pl.DataFrame({"timestamp": [], "value": []})

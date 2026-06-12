@@ -8,7 +8,14 @@ from __future__ import annotations
 
 
 def bars(symbol: str, timeframe: str) -> str:
-    """Build key for bar data."""
+    """Build key for bar data.
+
+    On disk, 1m bars resolve to
+    ``{key}/year=YYYY/month=MM/*.parquet``; coarser bar timeframes
+    remain under ``{key}/year=YYYY/*.parquet``. Cross-sectional reads
+    via :meth:`ParquetStore.read_multi` parse ``symbol`` from the
+    segment immediately preceding ``bars``.
+    """
     return f"{symbol}/bars/{timeframe}"
 
 

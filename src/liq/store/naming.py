@@ -9,6 +9,12 @@ Example: 20240101T000000-20240104T235959.parquet
 
 This enables sub-partition pruning by allowing queries to skip files
 that don't overlap with the requested time range.
+
+The partition directories above these filenames are
+``year=YYYY/month=MM/`` for 1m bar keys and historical non-bar time
+series. Coarser bar timeframes remain under ``year=YYYY/``. See
+:mod:`liq.store.key_layout` for the helpers that resolve a key into
+its on-disk file list across both layouts.
 """
 
 import re
