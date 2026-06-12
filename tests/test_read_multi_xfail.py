@@ -1,7 +1,7 @@
-"""Phase 0 contract stub: ``TimeSeriesStore.read_multi`` (Phase 3 deliverable).
+"""Contract stub for ``TimeSeriesStore.read_multi`` (planned, not built).
 
-Strict xfail flips green when Phase 3 lands the cross-sectional read
-path per liq-scan-plan §3.6:
+Strict xfail. Flips green when the cross-sectional read path lands
+per the liq-scan plan §3.6:
 
     def read_multi(
         self,
@@ -12,9 +12,9 @@ path per liq-scan-plan §3.6:
         columns: Sequence[str] | None = None,
     ) -> pl.DataFrame: ...
 
-The signature here is intentionally minimal — Phase 3 owns the full
-contract test, including missing-key behavior and the monthly-partition
-backwards-compat union (plan §3.7).
+The signature here is intentionally minimal — the full contract test
+(missing-key behavior, monthly-partition backwards-compat union, etc.)
+lands with the real implementation. See ``liq-scan-plan.md`` §3.6 / §3.7.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import pytest
 
 @pytest.mark.xfail(
     strict=True,
-    reason="Phase 3 deliverable — TimeSeriesStore.read_multi not yet implemented",
+    reason="TimeSeriesStore.read_multi not yet implemented (planned)",
 )
 def test_read_multi_protocol_member_exists() -> None:
     from liq.store.protocols import TimeSeriesStore  # noqa: PLC0415 — protocol target
