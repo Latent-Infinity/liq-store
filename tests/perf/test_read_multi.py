@@ -89,7 +89,7 @@ def test_read_multi_500_symbols_under_1s(tmp_path: Path) -> None:
     timings = []
     for _ in range(TIMED_RUNS):
         t0 = time.perf_counter()
-        df = store.read_multi(keys, start=start, end=end)
+        df = store.read_multi(keys, start=start, end=end).data
         elapsed = time.perf_counter() - t0
         assert df.height == 500 * ONE_SESSION_BARS
         timings.append(elapsed)

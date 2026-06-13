@@ -26,7 +26,7 @@ from liq.store.exceptions import (
     StorageError,
 )
 from liq.store.naming import generate_filename, is_timestamp_filename, parse_filename
-from liq.store.parquet import ParquetStore, ParquetStoreConfig
+from liq.store.parquet import MultiReadResult, ParquetStore, ParquetStoreConfig
 from liq.store.protocols import TimeSeriesStore
 
 __all__ = [
@@ -34,6 +34,7 @@ __all__ = [
     "TimeSeriesStore",
     # Implementations
     "ParquetStore",
+    "MultiReadResult",
     # Configuration
     "ParquetStoreConfig",
     "load_parquet_config_from_env",

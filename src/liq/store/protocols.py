@@ -6,9 +6,12 @@ Using Protocol instead of ABC enables structural subtyping (duck typing).
 
 from collections.abc import Sequence
 from datetime import date, datetime
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import polars as pl
+
+if TYPE_CHECKING:
+    from liq.store.parquet import MultiReadResult
 
 
 @runtime_checkable
@@ -138,14 +141,13 @@ class TimeSeriesStore(Protocol):
         end: datetime,
         *,
         columns: Sequence[str] | None = None,
-    ) -> pl.DataFrame:
+    ) -> "MultiReadResult":
         """Read one time window across N keys in a single call.
 
-        Returns long-format with a ``symbol`` column populated from
-        the key. The half-open window ``[start, end)`` is applied
-        identically to every key. Keys with no data for the window
-        contribute no rows — missing keys are not an error (loud
-        failure is the caller's job, not the store's).
+        Returns a ``MultiReadResult(data, missing_keys)`` so the
+        caller can decide whether partial coverage is a fail-loud
+        condition. The half-open window ``[start, end)`` is applied
+        identically to every key.
 
         Args:
             keys: Storage keys to read; each must address a bar/time-
@@ -158,8 +160,8 @@ class TimeSeriesStore(Protocol):
                 always included in the output).
 
         Returns:
-            Long-format ``pl.DataFrame`` with the selected columns +
-            ``symbol``. Empty DataFrame if every key is missing or
-            yields no rows in the window.
+            ``MultiReadResult`` whose ``data`` carries the selected
+            columns plus ``symbol`` and whose ``missing_keys`` is
+            the sorted tuple of input keys that had no data on disk.
         """
         ...

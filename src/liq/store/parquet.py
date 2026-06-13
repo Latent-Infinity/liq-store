@@ -22,12 +22,13 @@ import fcntl
 import logging
 import os
 import shutil
+import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast, overload
+from typing import TYPE_CHECKING, Literal, NamedTuple, cast, overload
 from uuid import uuid4
 
 import duckdb
@@ -51,6 +52,20 @@ if TYPE_CHECKING:
 CompressionType = Literal["lz4", "uncompressed", "snappy", "gzip", "brotli", "zstd"]
 
 logger = logging.getLogger(__name__)
+
+
+class MultiReadResult(NamedTuple):
+    """Result of a cross-sectional ``read_multi`` call.
+
+    Carries the long-format DataFrame alongside an *explicit* list of
+    requested keys that had no data on disk. Returning the missing
+    list as a sidecar (rather than dropping it silently) means the
+    scanner can decide whether partial coverage is a fail-loud
+    condition without re-checking ``exists()`` per key.
+    """
+
+    data: pl.DataFrame
+    missing_keys: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -762,34 +777,66 @@ class ParquetStore:
         end: datetime,
         *,
         columns: Sequence[str] | None = None,
-    ) -> pl.DataFrame:
+    ) -> MultiReadResult:
         """Read one time window across N bar keys in a single call.
 
         Implemented as one DuckDB ``read_parquet`` scan over the file
         list, joined to a temporary filename-to-symbol table. Missing
         keys (no parquet files on disk) contribute zero rows but never
-        raise; loud failure on missing coverage is the scanner's job,
-        not the store's.
+        raise; the names of those keys are surfaced in
+        :attr:`MultiReadResult.missing_keys` so the scanner can fail
+        loud on partial coverage.
 
         Both the current 1m ``year=YYYY/month=MM/`` layout and
         ``year=YYYY/`` files are read in one shot via
         :func:`liq.store.key_layout.partition_files`, so callers do not
         need to migrate before sweeping.
+
+        Emits one INFO log per call with ``event=read_multi`` and
+        ``keys_count``, ``start``, ``end``, ``latency_ms``,
+        ``missing_count`` so an operator can reconstruct a sweep
+        without inspecting application-level state.
         """
+        t0 = time.perf_counter()
+
         if not keys:
-            return pl.DataFrame()
+            self._log_read_multi(keys_count=0, start=start, end=end, t0=t0, missing_count=0)
+            return MultiReadResult(data=pl.DataFrame(), missing_keys=())
 
         # Resolve symbols up-front so an invalid key fails fast (per
         # ``symbol_from_bar_key`` contract) rather than partway through
         # the union build.
-        symbol_by_key = {k: symbol_from_bar_key(k) for k in keys}
+        try:
+            symbol_by_key = {k: symbol_from_bar_key(k) for k in keys}
+        except ValueError:
+            self._log_read_multi(
+                keys_count=len(keys),
+                start=start,
+                end=end,
+                t0=t0,
+                missing_count=0,
+            )
+            raise
 
         file_symbols: list[tuple[str, str]] = []
+        present_keys: set[str] = set()
         for k in keys:
             files = partition_files(self._key_to_path(k))
-            file_symbols.extend((path, symbol_by_key[k]) for path in files)
+            if files:
+                present_keys.add(k)
+                file_symbols.extend((path, symbol_by_key[k]) for path in files)
+
+        missing = tuple(sorted(k for k in keys if k not in present_keys))
+
         if not file_symbols:
-            return pl.DataFrame()
+            self._log_read_multi(
+                keys_count=len(keys),
+                start=start,
+                end=end,
+                t0=t0,
+                missing_count=len(missing),
+            )
+            return MultiReadResult(data=pl.DataFrame(), missing_keys=missing)
 
         select_cols = list(columns) if columns else None
         select_list = (
@@ -799,6 +846,12 @@ class ParquetStore:
 
         conn = duckdb.connect(database=":memory:")
         try:
+            # DuckDB's default ``TIMESTAMP WITH TIME ZONE`` output converts
+            # to the system TZ on serialization. Pin to UTC so the
+            # round-trip preserves the parquet's recorded zone — schema-
+            # stability across single-key ``read`` and cross-sectional
+            # ``read_multi`` is a load-bearing invariant.
+            conn.execute("SET TimeZone='UTC'")
             conn.execute("CREATE TEMP TABLE file_symbols(filename VARCHAR, symbol VARCHAR)")
             conn.executemany(
                 "INSERT INTO file_symbols VALUES (?, ?)",
@@ -816,11 +869,40 @@ class ParquetStore:
             conn.close()
 
         df = cast(pl.DataFrame, pl.from_arrow(arrow_table))
-        if df.is_empty():
-            return df
-        if "timestamp" in df.columns:
+        if not df.is_empty() and "timestamp" in df.columns:
             df = df.sort(["symbol", "timestamp"])
-        return df
+
+        self._log_read_multi(
+            keys_count=len(keys),
+            start=start,
+            end=end,
+            t0=t0,
+            missing_count=len(missing),
+        )
+        return MultiReadResult(data=df, missing_keys=missing)
+
+    def _log_read_multi(
+        self,
+        *,
+        keys_count: int,
+        start: datetime,
+        end: datetime,
+        t0: float,
+        missing_count: int,
+    ) -> None:
+        """Emit the single ``event=read_multi`` log record per call."""
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            "read_multi",
+            extra={
+                "event": "read_multi",
+                "keys_count": keys_count,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "latency_ms": latency_ms,
+                "missing_count": missing_count,
+            },
+        )
 
     def exists(self, key: str) -> bool:
         """Check if data exists for a key.

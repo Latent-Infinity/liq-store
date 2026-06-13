@@ -70,7 +70,7 @@ class TestReadMultiCorrectness:
             [_key(s) for s in symbols],
             start=datetime(2024, 6, 3, tzinfo=UTC),
             end=datetime(2024, 6, 4, tzinfo=UTC),
-        )
+        ).data
 
         assert "symbol" in df.columns
         assert set(df["symbol"].unique().to_list()) == set(symbols)
@@ -84,7 +84,7 @@ class TestReadMultiCorrectness:
             [_key("AAPL")],
             start=datetime(2024, 6, 3, 14, 30, tzinfo=UTC),
             end=datetime(2024, 6, 3, 14, 32, tzinfo=UTC),
-        )
+        ).data
         assert df.height == 2
 
     def test_column_subset_returns_requested_plus_symbol(self, store: ParquetStore) -> None:
@@ -94,7 +94,7 @@ class TestReadMultiCorrectness:
             start=datetime(2024, 6, 3, tzinfo=UTC),
             end=datetime(2024, 6, 4, tzinfo=UTC),
             columns=["timestamp", "close"],
-        )
+        ).data
         assert set(df.columns) == {"timestamp", "close", "symbol"}
 
 
@@ -104,28 +104,31 @@ class TestReadMultiCorrectness:
 class TestReadMultiMissingKeys:
     def test_missing_key_returns_other_symbols_only(self, store: ParquetStore) -> None:
         _seed(store, ["AAPL"])  # no MSFT
-        df = store.read_multi(
+        result = store.read_multi(
             [_key("AAPL"), _key("MSFT")],
             start=datetime(2024, 6, 3, tzinfo=UTC),
             end=datetime(2024, 6, 4, tzinfo=UTC),
         )
-        assert set(df["symbol"].unique().to_list()) == {"AAPL"}
+        assert set(result.data["symbol"].unique().to_list()) == {"AAPL"}
+        assert result.missing_keys == (_key("MSFT"),)
 
     def test_all_missing_returns_empty_frame(self, store: ParquetStore) -> None:
-        df = store.read_multi(
+        result = store.read_multi(
             [_key("NONE")],
             start=datetime(2024, 6, 3, tzinfo=UTC),
             end=datetime(2024, 6, 4, tzinfo=UTC),
         )
-        assert df.is_empty()
+        assert result.data.is_empty()
+        assert result.missing_keys == (_key("NONE"),)
 
     def test_empty_keys_list_returns_empty_frame(self, store: ParquetStore) -> None:
-        df = store.read_multi(
+        result = store.read_multi(
             [],
             start=datetime(2024, 6, 3, tzinfo=UTC),
             end=datetime(2024, 6, 4, tzinfo=UTC),
         )
-        assert df.is_empty()
+        assert result.data.is_empty()
+        assert result.missing_keys == ()
 
 
 # ----- backwards-compat (legacy year-only layout) ---------------------------
@@ -155,7 +158,7 @@ class TestBackwardsCompatLayout:
             [_key(sym)],
             start=datetime(2023, 1, 1, tzinfo=UTC),
             end=datetime(2025, 1, 1, tzinfo=UTC),
-        )
+        ).data
         ts = sorted(t.date() for t in df["timestamp"].to_list())
         assert date(2023, 6, 3) in ts  # legacy year-only data surfaced
         assert date(2024, 6, 4) in ts  # new monthly-partition data surfaced
@@ -173,7 +176,7 @@ class TestHalfOpenWindow:
             [_key("AAPL")],
             start=datetime(2024, 6, 3, 14, 30, tzinfo=UTC),
             end=datetime(2024, 6, 3, 14, 34, tzinfo=UTC),
-        )
+        ).data
         assert df.height == 4
 
 
@@ -191,7 +194,7 @@ class TestSymbolExtraction:
             [f"databento/{sym}/bars/1m"],
             start=datetime(2024, 6, 3, tzinfo=UTC),
             end=datetime(2024, 6, 4, tzinfo=UTC),
-        )
+        ).data
         assert df["symbol"].unique().to_list() == ["AAPL"]
 
     def test_unprefixed_key(self, store: ParquetStore, tmp_path: Path) -> None:
@@ -201,7 +204,7 @@ class TestSymbolExtraction:
             [f"{sym}/bars/1m"],
             start=datetime(2024, 6, 3, tzinfo=UTC),
             end=datetime(2024, 6, 4, tzinfo=UTC),
-        )
+        ).data
         assert df["symbol"].unique().to_list() == ["MSFT"]
 
     def test_non_bar_key_raises(self, store: ParquetStore) -> None:

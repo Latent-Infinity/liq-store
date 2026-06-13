@@ -16,7 +16,15 @@ def read_multi(
     end: datetime,
     *,
     columns: Sequence[str] | None = None,
-) -> pl.DataFrame
+) -> MultiReadResult
+```
+
+`MultiReadResult` is a NamedTuple:
+
+```python
+class MultiReadResult(NamedTuple):
+    data: pl.DataFrame
+    missing_keys: tuple[str, ...]
 ```
 
 * `keys` — bar keys (e.g. `"databento/AAPL/bars/1m"`). The symbol is
@@ -26,17 +34,26 @@ def read_multi(
   identically to every key.
 * `columns` — optional column subset (e.g. `["timestamp", "close"]`).
   `symbol` is always added to the output.
-* Returns a long-format `pl.DataFrame` sorted by `(symbol,
+* `result.data` — long-format `pl.DataFrame` sorted by `(symbol,
   timestamp)`. Empty `DataFrame` when every key is missing or
   produces zero rows in the window.
+* `result.missing_keys` — sorted tuple of input keys whose on-disk
+  partition was empty. Useful for the scanner to fail loud on
+  partial coverage without re-checking `exists()` per key.
+
+`MultiReadResult` is a NamedTuple, so destructuring also works:
+
+```python
+data, missing = store.read_multi(keys, start, end)
+```
 
 ## Missing-key semantics
 
 Missing keys contribute zero rows but are **not** errors. The store
 is data-availability-agnostic — failing loud when coverage is
 incomplete is the scanner's job, not the store's. Callers that need
-"all keys must have data" should pre-check via `exists(...)` or
-inspect the unique-symbol set on the result.
+"all keys must have data" can inspect `result.missing_keys` directly
+and raise if it is non-empty.
 
 ## Backwards-compat layout
 
@@ -69,12 +86,12 @@ runs do not include the perf benchmarks.
 
 ## Why DuckDB
 
-The implementation issues one DuckDB `SELECT … UNION ALL …` per key
-list, with each subquery selecting only the requested columns and
-filtering by timestamp. DuckDB's `read_parquet` is significantly
-faster than per-key `polars.scan_parquet` when N keys are involved,
-because the file-open and predicate-pushdown overhead is amortized
-across the union plan rather than paid per Python call.
+The implementation issues one DuckDB `read_parquet([...],
+filename=true)` scan over the full file list, then joins each row to a
+temporary filename-to-symbol table. DuckDB's `read_parquet` is
+significantly faster than per-key `polars.scan_parquet` when N keys
+are involved, because file-open and predicate-pushdown overhead is
+amortized across one vectorized scan rather than paid per Python call.
 
 DuckDB sits in-memory only — no on-disk database is created and the
 connection is closed at the end of every call.
