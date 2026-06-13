@@ -864,11 +864,17 @@ class ParquetStore:
                 "JOIN file_symbols AS m ON p.filename = m.filename "
                 "WHERE p.timestamp >= ? AND p.timestamp < ?"
             )
-            arrow_table = conn.execute(sql, [all_files, start, end]).arrow()
+            arrow_result = conn.execute(sql, [all_files, start, end]).arrow()
+            read_all = getattr(arrow_result, "read_all", None)
+            arrow_table = read_all() if callable(read_all) else arrow_result
         finally:
             conn.close()
 
-        df = cast(pl.DataFrame, pl.from_arrow(arrow_table))
+        df = (
+            pl.DataFrame()
+            if arrow_table.num_rows == 0
+            else cast(pl.DataFrame, pl.from_arrow(arrow_table))
+        )
         if not df.is_empty() and "timestamp" in df.columns:
             df = df.sort(["symbol", "timestamp"])
 

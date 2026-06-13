@@ -84,6 +84,20 @@ class TestMultiReadResult:
         assert result.missing_keys == ()
         assert set(result.data["symbol"].unique().to_list()) == {"AAPL", "MSFT"}
 
+    def test_present_files_with_no_rows_in_window_return_empty_data(
+        self, store: ParquetStore
+    ) -> None:
+        store.write(_key("AAPL"), _bars("AAPL"))
+
+        result = store.read_multi(
+            [_key("AAPL")],
+            start=datetime(2024, 6, 4, tzinfo=UTC),
+            end=datetime(2024, 6, 5, tzinfo=UTC),
+        )
+
+        assert result.data.is_empty()
+        assert result.missing_keys == ()
+
     def test_all_missing_yields_empty_data_and_full_missing_list(self, store: ParquetStore) -> None:
         result = store.read_multi(
             [_key("NONE1"), _key("NONE2")],
