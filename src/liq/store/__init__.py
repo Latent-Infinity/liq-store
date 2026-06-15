@@ -5,6 +5,10 @@ This package provides storage backends for time-series financial data,
 including Parquet-based storage with ZSTD compression.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
 from liq.store import key_builder
 from liq.store.artifacts import (
     EVOLUTION_ARTIFACT_SCHEMA_VERSION,
@@ -14,7 +18,6 @@ from liq.store.artifacts import (
     normalize_evolution_artifact_payload,
     serialize_evolution_artifact_payload,
 )
-from liq.store.config import create_parquet_store_from_env, load_parquet_config_from_env
 from liq.store.exceptions import (
     ArtifactMigrationError,
     ConcurrentWriteError,
@@ -26,8 +29,40 @@ from liq.store.exceptions import (
     StorageError,
 )
 from liq.store.naming import generate_filename, is_timestamp_filename, parse_filename
-from liq.store.parquet import MultiReadResult, ParquetStore, ParquetStoreConfig
 from liq.store.protocols import TimeSeriesStore
+
+if TYPE_CHECKING:
+    from liq.store.config import create_parquet_store_from_env, load_parquet_config_from_env
+    from liq.store.parquet import MultiReadResult, ParquetStore, ParquetStoreConfig
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily expose DuckDB-backed Parquet objects.
+
+    Importing ``liq.store`` should make protocols, exceptions, naming,
+    and artifact helpers available without loading the Parquet backend.
+    ``ParquetStore`` itself still imports DuckDB when explicitly
+    requested.
+    """
+    if name in {"ParquetStore", "ParquetStoreConfig", "MultiReadResult"}:
+        from liq.store.parquet import MultiReadResult, ParquetStore, ParquetStoreConfig
+
+        exports = {
+            "ParquetStore": ParquetStore,
+            "ParquetStoreConfig": ParquetStoreConfig,
+            "MultiReadResult": MultiReadResult,
+        }
+        return exports[name]
+    if name in {"load_parquet_config_from_env", "create_parquet_store_from_env"}:
+        from liq.store.config import create_parquet_store_from_env, load_parquet_config_from_env
+
+        exports = {
+            "load_parquet_config_from_env": load_parquet_config_from_env,
+            "create_parquet_store_from_env": create_parquet_store_from_env,
+        }
+        return exports[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Protocols
