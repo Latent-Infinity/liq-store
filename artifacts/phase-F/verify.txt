@@ -1,0 +1,29 @@
+=== liq-store verify (pytest + cov + ruff check) ===
+........................................................................ [ 32%]
+........................................................................ [ 64%]
+........................................................................ [ 96%]
+........./Users/firestrand/.pyenv/versions/3.12.8/lib/python3.12/site-packages/coverage/inorout.py:537: CoverageWarning: Module liq.store was previously imported, but not measured (module-not-measured); see https://coverage.readthedocs.io/en/7.10.7/messages.html#warning-module-not-measured
+  self.warn(msg, slug="module-not-measured")
+                                                                [100%]
+================================ tests coverage ================================
+_______________ coverage: platform darwin, python 3.12.8-final-0 _______________
+
+Name                           Stmts   Miss Branch BrPart  Cover   Missing
+--------------------------------------------------------------------------
+src/liq/store/__init__.py         18      5      4      1    64%   56-64
+src/liq/store/__main__.py          3      3      0      0     0%   3-7
+src/liq/store/artifacts.py       102     19     48     13    72%   24-31, 40->42, 43, 49-52, 62->73, 75->79, 77, 80->83, 84->87, 138, 142, 145, 163-164, 175
+src/liq/store/cli.py              52      2     14      2    94%   40, 45
+src/liq/store/config.py           27      0      4      0   100%
+src/liq/store/exceptions.py        8      0      0      0   100%
+src/liq/store/key_builder.py      19      0      0      0   100%
+src/liq/store/key_layout.py       27      0      8      0   100%
+src/liq/store/naming.py           22      0      2      0   100%
+src/liq/store/parquet.py         432      9    172     14    96%   399-402, 409-410, 417-419, 451->453, 457->462, 466->468, 712->714, 716->719, 746->749, 749->754, 769->771, 969->973, 1018->1006, 1051->1059, 1061->1069
+src/liq/store/protocols.py        14      0      0      0   100%
+--------------------------------------------------------------------------
+TOTAL                            724     38    252     30    91%
+Required test coverage of 90% reached. Total coverage: 91.39%
+
+=== ruff check src/ tests/ ===
+All checks passed!
