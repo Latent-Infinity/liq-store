@@ -67,7 +67,6 @@ packages = ["src/liq"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q --cov=liq.store --cov-report=term-missing --cov-fail-under=90 -m 'not perf'"
-asyncio_mode = "auto"
 markers = [
     "perf: opt-in performance benchmarks (excluded from default run)",
 ]
