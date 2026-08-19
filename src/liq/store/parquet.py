@@ -291,7 +291,13 @@ class ParquetStore:
 
         return existing_is_numeric and new_is_numeric
 
-    def _merge_and_dedupe(self, existing: pl.DataFrame, new: pl.DataFrame) -> pl.DataFrame:
+    def _merge_and_dedupe(
+        self,
+        existing: pl.DataFrame,
+        new: pl.DataFrame,
+        *,
+        dedupe_subset: Sequence[str] | None = None,
+    ) -> pl.DataFrame:
         """Merge existing and new data with deduplication.
 
         Args:
@@ -305,13 +311,21 @@ class ParquetStore:
         # This allows type coercion (e.g., Int32 -> Int64) and missing columns become null
         combined = pl.concat([existing, new], how="diagonal_relaxed")
 
-        subset: list[str] = []
-        if "timestamp" in combined.columns:
-            subset.append("timestamp")
-        if "symbol" in combined.columns:
-            subset.append("symbol")
-        if "provider" in combined.columns:
-            subset.append("provider")
+        if dedupe_subset is None:
+            subset: list[str] = []
+            if "timestamp" in combined.columns:
+                subset.append("timestamp")
+            if "symbol" in combined.columns:
+                subset.append("symbol")
+            if "provider" in combined.columns:
+                subset.append("provider")
+        else:
+            subset = list(dedupe_subset)
+            missing = [column for column in subset if column not in combined.columns]
+            if missing:
+                raise SchemaCompatibilityError(
+                    "Deduplication columns absent from data: " + ", ".join(missing)
+                )
 
         if subset:
             combined = combined.unique(subset=subset, keep="last")
@@ -320,13 +334,22 @@ class ParquetStore:
 
         return combined
 
-    def write(self, key: str, data: pl.DataFrame, mode: str = "append") -> None:
+    def write(
+        self,
+        key: str,
+        data: pl.DataFrame,
+        mode: str = "append",
+        *,
+        dedupe_subset: Sequence[str] | None = None,
+    ) -> None:
         """Write time-series data to storage.
 
         Args:
             key: Storage key (e.g., "forex/EUR_USD")
             data: Polars DataFrame with time-series data
             mode: Write mode - "append" (default) or "overwrite"
+            dedupe_subset: Optional explicit uniqueness key for non-standard
+                tables. Defaults to timestamp/symbol/provider inference.
 
         Raises:
             StorageError: If write operation fails
@@ -447,7 +470,11 @@ class ParquetStore:
                             if mode != "overwrite" and existing_files:
                                 existing_df = pl.read_parquet(existing_files)
                                 self._check_schema_compatibility(existing_df.schema, part_df.schema)
-                            merged = self._merge_and_dedupe(existing_df, part_df)
+                            merged = self._merge_and_dedupe(
+                                existing_df,
+                                part_df,
+                                dedupe_subset=dedupe_subset,
+                            )
                             if "timestamp" in merged.columns:
                                 merged = merged.sort("timestamp")
                             self._write_chunked(merged, part_dest)
@@ -459,7 +486,11 @@ class ParquetStore:
                             if existing_glob:
                                 existing_df = pl.read_parquet(existing_glob)
                                 self._check_schema_compatibility(existing_df.schema, data.schema)
-                        merged = self._merge_and_dedupe(existing_df, data)
+                        merged = self._merge_and_dedupe(
+                            existing_df,
+                            data,
+                            dedupe_subset=dedupe_subset,
+                        )
                         self._write_chunked(merged, temp_path)
 
                     # Atomic swap
@@ -490,6 +521,7 @@ class ParquetStore:
         data: pl.DataFrame,
         *,
         require_exists: bool = False,
+        dedupe_subset: Sequence[str] | None = None,
     ) -> None:
         """Overwrite data for a key with explicit intent.
 
@@ -497,13 +529,14 @@ class ParquetStore:
             key: Storage key
             data: Polars DataFrame with time-series data
             require_exists: If True, raise when key does not exist
+            dedupe_subset: Optional explicit uniqueness key.
 
         Raises:
             DataNotFoundError: If require_exists is True and key doesn't exist
         """
         if require_exists and not self.exists(key):
             raise DataNotFoundError(f"Key '{key}' does not exist for overwrite")
-        self.write(key, data, mode="overwrite")
+        self.write(key, data, mode="overwrite", dedupe_subset=dedupe_subset)
 
     def _write_chunked(self, df: pl.DataFrame, path: Path) -> None:
         """Write DataFrame in optimally-sized chunks.

@@ -280,6 +280,37 @@ class TestTimestampColumnHandling:
         # Order should be preserved (no timestamp sorting)
         assert result["id"].to_list() == [3, 1, 2]
 
+    def test_explicit_composite_key_preserves_cross_sectional_history(
+        self, temp_storage_path: Path
+    ) -> None:
+        store = ParquetStore(str(temp_storage_path))
+        frame = pl.DataFrame(
+            {
+                "settlement_date": [
+                    date(2024, 1, 15),
+                    date(2024, 1, 15),
+                    date(2024, 1, 31),
+                ],
+                "symbol": ["A", "A", "A"],
+                "short_interest": [100, 110, 120],
+            }
+        )
+
+        store.write(
+            "reference/short_interest",
+            frame,
+            mode="overwrite",
+            dedupe_subset=("settlement_date", "symbol"),
+        )
+
+        result = store.read("reference/short_interest").sort("settlement_date")
+        assert result.height == 2
+        assert result["settlement_date"].to_list() == [
+            date(2024, 1, 15),
+            date(2024, 1, 31),
+        ]
+        assert result["short_interest"].to_list() == [110, 120]
+
     def test_no_timestamp_column_skips_date_filter(self, temp_storage_path: Path) -> None:
         """Date filters should be ignored for data without timestamp."""
         store = ParquetStore(str(temp_storage_path))

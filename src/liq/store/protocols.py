@@ -30,7 +30,14 @@ class TimeSeriesStore(Protocol):
 
     Example:
         class ParquetStore:
-            def write(self, key: str, data: pl.DataFrame, mode: str = "append") -> None:
+            def write(
+                self,
+                key: str,
+                data: pl.DataFrame,
+                mode: str = "append",
+                *,
+                dedupe_subset: Sequence[str] | None = None,
+            ) -> None:
                 ...
 
             def read(self, key: str, start: date | None = None, end: date | None = None) -> pl.DataFrame:
@@ -42,7 +49,14 @@ class TimeSeriesStore(Protocol):
         store: TimeSeriesStore = ParquetStore(...)
     """
 
-    def write(self, key: str, data: pl.DataFrame, mode: str = "append") -> None:
+    def write(
+        self,
+        key: str,
+        data: pl.DataFrame,
+        mode: str = "append",
+        *,
+        dedupe_subset: Sequence[str] | None = None,
+    ) -> None:
         """Write time-series data to storage.
 
         Args:
@@ -50,6 +64,7 @@ class TimeSeriesStore(Protocol):
             data: Polars DataFrame with time-series data
                   Expected columns: timestamp, and domain-specific columns
             mode: Write mode - "append" (default) or "overwrite"
+            dedupe_subset: Optional explicit uniqueness key for tabular data.
 
         Raises:
             StorageError: If write operation fails
