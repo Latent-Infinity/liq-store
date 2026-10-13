@@ -1,0 +1,16 @@
+{
+  "kind": "APPROVED_REAL_TIMESTAMP_FIXTURE",
+  "use": "DEV_SMOKE_ONLY",
+  "symbol": "KHC",
+  "timeframe": "1m",
+  "dates": ["2023-04-21", "2023-04-24"],
+  "rows": 449,
+  "schema": "timestamp[us, UTC]",
+  "source": "liq-experiments/tests/fixtures/approved/ecology/bars/khc_20230421-20230424.parquet",
+  "source_sha256": "d4479cdb37c33a93fd445f4311c9b773de3fee95fd619903bb06fd90234afb30",
+  "derivative": "khc-timestamps-20230421-20230424.parquet",
+  "derivative_sha256": "7920d9eabd8b2a3ce9392ad82815b8a9eb8c52409c10846ffbcfcecb5fbc49bc",
+  "transform": "Previously approved exact timestamp-only projection with timestamp statistics and Snappy compression; all 449 values, dates, units and order preserved. This copy is byte-identical to that approved derivative.",
+  "engineering_authority": "liq-docs/plans/oracle-classical-ranker-timestamp-domain-engineering-decision-2026-10-02.md",
+  "financial_observations_fabricated": false
+}

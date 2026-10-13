@@ -82,7 +82,7 @@ exclude_lines = [
     "if __name__ == .__main__.:",
     "@abstractmethod",
     "raise NotImplementedError",
-    "\\.\\.\\.",  # Protocol method stubs
+    "^\\s*\\.\\.\\.\\s*$",  # Protocol method stubs
     "pass",
 ]
 
