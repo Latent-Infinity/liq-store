@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from liq.store.bounded_parquet import PinnedReadRefused, _PinnedReadBudget
 from liq.store.exceptions import DataCorruptionError
 
 
@@ -56,33 +57,95 @@ def _stat_identity(info: os.stat_result) -> tuple[int, ...]:
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
-def _pinned_bytes(root: Path, identity: PinnedParquetFile, maximum: int) -> bytes:
-    parts = root.parts[1:] + _parts(identity.path)
+def _pinned_bytes(
+    root: Path,
+    identity: PinnedParquetFile,
+    maximum: int,
+    *,
+    budget: _PinnedReadBudget | None = None,
+) -> bytes:
+    if budget is not None:
+        if (
+            type(budget) is not _PinnedReadBudget
+            or not isinstance(root, Path)
+            or not root.is_absolute()
+            or ".." in root.parts
+            or not isinstance(identity, PinnedParquetFile)
+            or type(identity.path) is not str
+            or type(identity.sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", identity.sha256) is None
+            or type(maximum) is not int
+            or maximum <= 0
+        ):
+            raise PinnedReadRefused("invalid_contract")
+        try:
+            leaf_parts = _parts(identity.path)
+        except TimestampMetadataRefused as exc:
+            raise PinnedReadRefused("invalid_contract") from exc
+        budget.limits.__post_init__()
+        parts = root.parts[1:] + leaf_parts
+        budget.before_open()
+    else:
+        parts = root.parts[1:] + _parts(identity.path)
     parent = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
+        if budget is not None:
+            budget.check_deadline()
         for part in parts[:-1]:
+            if budget is not None:
+                budget.before_open()
             next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
             os.close(parent)
             parent = next_fd
+            if budget is not None:
+                budget.check_deadline()
+        if budget is not None:
+            budget.before_open()
         fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         try:
+            if budget is not None:
+                budget.check_deadline()
             before = os.fstat(fd)
+            if budget is not None:
+                budget.check_deadline()
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
                 raise TimestampMetadataRefused("file must be regular and singly linked")
+            if (
+                budget is not None
+                and before.st_size > 0
+                and (
+                    before.st_size > min(maximum, budget.limits.max_source_size_bytes)
+                    or before.st_size > budget.limits.max_total_read_bytes - budget.total_read_bytes
+                )
+            ):
+                raise PinnedReadRefused("resource_limit")
             if not 0 < before.st_size <= maximum:
                 raise TimestampMetadataRefused("file size budget")
             chunks: list[bytes] = []
             remaining = before.st_size
             while remaining:
-                chunk = os.read(fd, min(remaining, 1024 * 1024))
+                request_size = (
+                    budget.before_read(remaining)
+                    if budget is not None
+                    else min(remaining, 1024 * 1024)
+                )
+                chunk = os.read(fd, request_size)
+                if budget is not None:
+                    budget.record_read(len(chunk))
                 if not chunk:
                     raise TimestampMetadataRefused("file truncated")
                 chunks.append(chunk)
                 remaining -= len(chunk)
-            if os.read(fd, 1):
+            if budget is None and os.read(fd, 1):
                 raise TimestampMetadataRefused("file grew")
+            if budget is not None:
+                budget.check_deadline()
             after = os.fstat(fd)
+            if budget is not None:
+                budget.check_deadline()
             located = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+            if budget is not None:
+                budget.check_deadline()
             if _stat_identity(before) != _stat_identity(after) or _stat_identity(
                 before
             ) != _stat_identity(located):
@@ -92,7 +155,12 @@ def _pinned_bytes(root: Path, identity: PinnedParquetFile, maximum: int) -> byte
     finally:
         os.close(parent)
     payload = b"".join(chunks)
-    if hashlib.sha256(payload).hexdigest() != identity.sha256:
+    if budget is not None:
+        budget.check_deadline()
+    digest = hashlib.sha256(payload).hexdigest()
+    if budget is not None:
+        budget.check_deadline()
+    if digest != identity.sha256:
         raise TimestampMetadataRefused("file digest mismatch")
     return payload
 
