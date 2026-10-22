@@ -4189,5 +4189,975 @@ class FooterProfileTests(unittest.TestCase):
         self.assertEqual(after[:7] + after[8:], before[:7] + before[8:])
 
 
+class _EnvelopeLoggedIO(_LoggedPinnedIO):
+    """Independent positional responses; no complete file or data is assembled."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.before = self.metadata(st_size=128)
+        self.after = self.metadata(st_size=128)
+        self.located = self.metadata(st_size=128)
+        self.responses = {
+            (0, 4): b"PAR1",
+            (120, 8): bytes.fromhex("0f 00 00 00 50 41 52 31"),
+            (105, 15): _GRAMMAR_ANCHOR,
+        }
+        self.positional_requests: list[tuple[int, int, int]] = []
+        self.close_attempts: list[int] = []
+        self.close_errors: dict[int, OSError] = {}
+        self.pread_error: OSError | None = None
+        self.fail_pread = 0
+        self.fstat_error = 0
+        self.stat_error = False
+
+    def open(self, path: str, flags: int, *, dir_fd: int | None = None) -> int:
+        required = os.O_NONBLOCK if path == "neutral.parquet" else os.O_DIRECTORY
+        if not flags & required:
+            raise AssertionError("acquisition requires directory or nonblocking leaf flags")
+        return super().open(path, flags, dir_fd=dir_fd)
+
+    def close(self, fd: int) -> None:
+        self.close_attempts.append(fd)
+        self.event(f"close:{fd}")
+        if fd in self.close_errors:
+            raise self.close_errors[fd]
+        self.closed.append(fd)
+
+    def fstat(self, fd: int) -> SimpleNamespace:
+        result = super().fstat(fd)
+        if self.fstat_calls == self.fstat_error:
+            raise OSError("neutral fstat failure")
+        return result
+
+    def stat(self, path: str, *, dir_fd: int, follow_symlinks: bool) -> SimpleNamespace:
+        result = super().stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if self.stat_error:
+            raise OSError("neutral stat failure")
+        return result
+
+    def pread(self, fd: int, length: int, offset: int) -> bytes:
+        if fd not in self.acquired or fd in self.close_attempts:
+            raise AssertionError("positional read requires live acquired leaf")
+        self.positional_requests.append((fd, length, offset))
+        self.event(f"pread:{len(self.positional_requests)}")
+        if len(self.positional_requests) == self.fail_pread:
+            raise self.pread_error or OSError("neutral positional failure")
+        return self.responses[(offset, length)]
+
+    def __enter__(self):
+        self.module = importlib.import_module("liq.store.timestamp_metadata")
+        self.identity = self.module.PinnedParquetFile(self.relative_path, self.digest)
+        source_os = SimpleNamespace(
+            O_RDONLY=os.O_RDONLY,
+            O_DIRECTORY=os.O_DIRECTORY,
+            O_NOFOLLOW=os.O_NOFOLLOW,
+            O_NONBLOCK=os.O_NONBLOCK,
+            open=self.open,
+            close=self.close,
+            fstat=self.fstat,
+            stat=self.stat,
+            read=self.read,
+            pread=self.pread,
+        )
+        self.stack.enter_context(patch.object(self.module, "os", source_os))
+        self.stack.enter_context(
+            patch.object(
+                self.module.os,
+                "read",
+                side_effect=AssertionError("sequential payload read forbidden"),
+            )
+        )
+        self.stack.enter_context(
+            patch.object(
+                self.module.hashlib,
+                "sha256",
+                side_effect=AssertionError("partial source hash forbidden"),
+            )
+        )
+        self.stack.enter_context(
+            patch.object(
+                self.module.pq, "ParquetFile", side_effect=AssertionError("native parser forbidden")
+            )
+        )
+        return self
+
+
+class FooterEnvelopeTests(unittest.TestCase):
+    """Neutral ownership and range contracts; no source admission or serializer."""
+
+    class IntegerSubclass(int):
+        pass
+
+    def api(self, module, *names: str):
+        found = {}
+        for name in names:
+            value = getattr(module, name, None)
+            self.assertTrue(callable(value), f"missing callable {name}")
+            found[name] = value
+        return SimpleNamespace(**found)
+
+    def budget(self, io: _EnvelopeLoggedIO, **changes: int):
+        limits = PinnedReadLimits(
+            max_source_size_bytes=2 * 1024 * 1024,
+            max_total_read_bytes=2 * 1024 * 1024,
+            max_source_opens=20,
+            max_decoded_rows=1,
+            max_output_rows=1,
+            max_row_groups=1,
+            max_row_group_uncompressed_bytes=1,
+            max_total_uncompressed_bytes=1,
+            batch_rows=1,
+            deadline_ns=100,
+        )
+        return bounded_parquet._PinnedReadBudget(replace(limits, **changes), clock_ns=io.clock)
+
+    def owner(self, io: _EnvelopeLoggedIO, budget):
+        api = self.api(io.module, "_pinned_source")
+        return api._pinned_source(io.root, io.identity, 2 * 1024 * 1024, budget=budget)
+
+    def envelope(self, io: _EnvelopeLoggedIO, budget=None, **changes: int):
+        api = self.api(bounded_parquet, "_read_footer_envelope")
+        values = {
+            "maximum": 2 * 1024 * 1024,
+            "max_footer_bytes": 1024,
+            "max_retained_payload_bytes": 2048,
+        }
+        values.update(changes)
+        return api._read_footer_envelope(
+            io.root, io.identity, budget=self.budget(io) if budget is None else budget, **values
+        )
+
+    def continuation(self):
+        return self.api(bounded_parquet, "_profile_footer_envelope")._profile_footer_envelope
+
+    def assert_cleanup(self, io: _EnvelopeLoggedIO) -> None:
+        self.assertCountEqual(io.close_attempts, io.acquired)
+        self.assertEqual(len(io.close_attempts), len(set(io.close_attempts)))
+
+    def assert_policy(self, reason: str, action, *args, **kwargs) -> None:
+        with self.assertRaises(PinnedReadRefused) as raised:
+            action(*args, **kwargs)
+        self.assertEqual(raised.exception.reason_code, reason)
+
+    def assert_integrity(self, io: _EnvelopeLoggedIO, reason: str, action, *args, **kwargs) -> None:
+        with self.assertRaises(io.module.TimestampMetadataRefused) as raised:
+            action(*args, **kwargs)
+        self.assertEqual(str(raised.exception), reason)
+
+    def test_owner_validates_before_acquisition(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            owner = self.api(io.module, "_pinned_source")._pinned_source
+            budget = self.budget(io)
+            cases = (
+                (Path("relative"), io.identity, 128, budget),
+                (Path("/sandbox/../other"), io.identity, 128, budget),
+                (io.root, io.module.PinnedParquetFile("../neutral.parquet", "0" * 64), 128, budget),
+                (io.root, io.module.PinnedParquetFile("neutral.parquet", "bad"), 128, budget),
+                (io.root, io.identity, True, budget),
+                (io.root, io.identity, 0, budget),
+                (io.root, io.identity, self.IntegerSubclass(128), budget),
+                (io.root, io.identity, 128, "invalid"),
+            )
+            for root, identity, maximum, selected in cases:
+                with self.subTest(root=root, maximum=maximum):
+                    with (
+                        self.assertRaises(PinnedReadRefused) as raised,
+                        owner(root, identity, maximum, budget=selected),
+                    ):
+                        self.fail("invalid owner yielded")
+                    self.assertEqual(raised.exception.reason_code, "invalid_contract")
+                    self.assertEqual(io.events, [])
+
+    def test_owner_counts_successful_and_failed_open_attempts(self) -> None:
+        for failure in range(1, 5):
+            with self.subTest(failed_open=failure), _EnvelopeLoggedIO() as io:
+                self.api(io.module, "_pinned_source")
+                budget = self.budget(io)
+                io.fail_open = failure
+                with self.assertRaises(OSError), self.owner(io, budget):
+                    self.fail("failed acquisition yielded")
+                self.assertEqual(budget.source_opens, failure)
+                self.assertEqual(len(io.open_paths), failure)
+                self.assert_cleanup(io)
+        for cap in (1, 2, 3):
+            with self.subTest(open_cap=cap), _EnvelopeLoggedIO() as io:
+                self.api(io.module, "_pinned_source")
+                budget = self.budget(io, max_source_opens=cap)
+                with self.assertRaises(PinnedReadRefused) as raised, self.owner(io, budget):
+                    self.fail("exhausted acquisition yielded")
+                self.assertEqual(raised.exception.reason_code, "resource_limit")
+                self.assertEqual((budget.source_opens, len(io.open_paths)), (cap, cap))
+                self.assert_cleanup(io)
+        for stage in ("open:1", "open:2", "open:3", "open:4", "fstat:1"):
+            with self.subTest(deadline=stage), _EnvelopeLoggedIO() as io:
+                self.api(io.module, "_pinned_source")
+                io.expire_after = stage
+                with (
+                    self.assertRaises(PinnedReadRefused) as raised,
+                    self.owner(io, self.budget(io)),
+                ):
+                    self.fail("expired acquisition yielded")
+                self.assertEqual(raised.exception.reason_code, "deadline_exceeded")
+                self.assertEqual(io.positional_requests, [])
+                self.assert_cleanup(io)
+
+    def test_owner_lifetime_and_borrowing(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            self.api(io.module, "_pinned_source")
+            budget = self.budget(io)
+            with self.owner(io, budget) as source:
+                self.assertEqual(source.borrow_fd(), 14)
+                self.assertEqual(source.size, 128)
+                self.assertEqual(source.identity, (1, 2, 128, 3, 4))
+                self.assertIs(source.budget, budget)
+                self.assertEqual(io.close_attempts, [11, 12])
+                for private in (
+                    str(io.root),
+                    io.relative_path,
+                    "neutral.parquet",
+                    str(source.identity),
+                ):
+                    self.assertNotIn(private, repr(source))
+            self.assertEqual(io.open_paths, ["/", "sandbox", "nested", "neutral.parquet"])
+            self.assertEqual(budget.source_opens, 4)
+            self.assertEqual(io.close_attempts, [11, 12, 14, 13])
+            self.assertLess(io.events.index("fstat:2"), io.events.index("stat"))
+            self.assertLess(io.events.index("stat"), io.events.index("close:14"))
+            self.assert_policy("invalid_contract", source.borrow_fd)
+            self.assertEqual(io.positional_requests, [])
+
+    def test_owner_distinguishes_source_and_read_limits(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            self.api(io.module, "_pinned_source")
+            budget = self.budget(io, max_total_read_bytes=1)
+            with self.owner(io, budget) as source:
+                self.assertEqual(source.size, 128)
+            self.assertEqual(budget.total_read_bytes, 0)
+        for maximum, cap in ((127, 128), (128, 127)):
+            with self.subTest(maximum=maximum, cap=cap), _EnvelopeLoggedIO() as io:
+                owner = self.api(io.module, "_pinned_source")._pinned_source
+                budget = self.budget(io, max_source_size_bytes=cap)
+                with (
+                    self.assertRaises(PinnedReadRefused) as raised,
+                    owner(io.root, io.identity, maximum, budget=budget),
+                ):
+                    self.fail("oversized source yielded")
+                self.assertEqual(raised.exception.reason_code, "resource_limit")
+                self.assertEqual(io.positional_requests, [])
+                self.assert_cleanup(io)
+        with _EnvelopeLoggedIO() as io:
+            self.api(io.module, "_pinned_source")
+            budget = self.budget(io, max_total_read_bytes=127)
+            self.assert_policy(
+                "resource_limit", io.module._pinned_bytes, io.root, io.identity, 128, budget=budget
+            )
+            self.assertEqual(budget.total_read_bytes, 0)
+            self.assert_cleanup(io)
+
+    def test_owner_preserves_consumer_errors(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            self.api(io.module, "_pinned_source")
+            failure = RuntimeError("neutral consumer failure")
+            with (
+                self.assertRaises(RuntimeError) as raised,
+                self.owner(io, self.budget(io)) as source,
+            ):
+                raise failure
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(io.fstat_calls, 1)
+            self.assertNotIn("stat", io.events)
+            self.assert_cleanup(io)
+            self.assert_policy("invalid_contract", source.borrow_fd)
+
+    def test_owner_checks_final_identity_before_return(self) -> None:
+        for stage in ("after", "located"):
+            for field_name in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"):
+                with self.subTest(stage=stage, field=field_name), _EnvelopeLoggedIO() as io:
+                    self.api(io.module, "_pinned_source")
+                    metadata = getattr(io, stage)
+                    setattr(metadata, field_name, getattr(metadata, field_name) + 1)
+                    with (
+                        self.assertRaises(io.module.TimestampMetadataRefused),
+                        self.owner(io, self.budget(io)),
+                    ):
+                        pass
+                    self.assert_cleanup(io)
+        for stage in ("fstat", "stat"):
+            with self.subTest(failure=stage), _EnvelopeLoggedIO() as io:
+                self.api(io.module, "_pinned_source")
+                io.fstat_error = 2 if stage == "fstat" else 0
+                io.stat_error = stage == "stat"
+                with self.assertRaises(OSError), self.owner(io, self.budget(io)):
+                    pass
+                self.assert_cleanup(io)
+
+    def test_owner_tracks_child_before_parent_close_failure(self) -> None:
+        for child_fails in (False, True):
+            with self.subTest(child_fails=child_fails), _EnvelopeLoggedIO() as io:
+                self.api(io.module, "_pinned_source")
+                failure = OSError("neutral parent close failure")
+                child_failure = OSError("neutral child cleanup failure")
+                io.close_errors[11] = failure
+                if child_fails:
+                    io.close_errors[12] = child_failure
+                with self.assertRaises(OSError) as raised, self.owner(io, self.budget(io)):
+                    self.fail("failed parent close yielded")
+                self.assertIs(raised.exception, failure)
+                self.assertIs(failure.__cause__, child_failure if child_fails else None)
+                self.assertEqual(io.acquired, [11, 12])
+                self.assertEqual(io.close_attempts, [11, 12])
+                self.assertEqual(io.closed, [] if child_fails else [12])
+                self.assertEqual(io.positional_requests, [])
+
+    def test_owner_retains_primary_and_cleanup_failures(self) -> None:
+        for consumer_fails in (False, True):
+            with self.subTest(consumer_fails=consumer_fails), _EnvelopeLoggedIO() as io:
+                self.api(io.module, "_pinned_source")
+                consumer = OSError("neutral operation failure")
+                leaf = OSError("neutral leaf close failure")
+                parent = OSError("neutral final parent failure")
+                io.close_errors = {14: leaf, 13: parent}
+                with (
+                    self.assertRaises(OSError) as raised,
+                    self.owner(io, self.budget(io)) as source,
+                ):
+                    if consumer_fails:
+                        raise consumer
+                primary = consumer if consumer_fails else leaf
+                self.assertIs(raised.exception, primary)
+                chain = []
+                current = primary.__cause__
+                for _ in range(3):
+                    if current is None:
+                        break
+                    chain.append(current)
+                    current = current.__cause__
+                self.assertEqual(chain, [] if consumer_fails else [parent])
+                state = BaseException.__dict__["__dict__"].__get__(primary, BaseException)
+                retained = state[io.module._PINNED_CLEANUP_ERRORS]
+                self.assertIs(type(retained), tuple)
+                self.assertEqual(len(retained), 2 if consumer_fails else 1)
+                self.assertIs(retained[0], leaf if consumer_fails else parent)
+                if consumer_fails:
+                    self.assertIs(retained[1], parent)
+                    self.assertIsNone(leaf.__cause__)
+                    self.assertIsNone(parent.__cause__)
+                    self.assertIs(leaf.__context__, consumer)
+                    self.assertIs(parent.__context__, consumer)
+                self.assertIsNone(current)
+                self.assert_cleanup(io)
+                self.assert_policy("invalid_contract", source.borrow_fd)
+
+    def test_owner_parent_close_failure_remains_primary(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            self.api(io.module, "_pinned_source")
+            parent_failure = OSError("neutral final parent close failure")
+            io.close_errors[13] = parent_failure
+
+            with self.assertRaises(OSError) as raised, self.owner(io, self.budget(io)) as source:
+                pass
+
+            self.assertIs(raised.exception, parent_failure)
+            self.assertIs(type(raised.exception), OSError)
+            self.assertIsNone(parent_failure.__cause__)
+            self.assertIsNone(parent_failure.__context__)
+            state = BaseException.__dict__["__dict__"].__get__(parent_failure, BaseException)
+            self.assertNotIn(io.module._PINNED_CLEANUP_ERRORS, state)
+            self.assertEqual(io.acquired, [11, 12, 13, 14])
+            self.assertEqual(io.close_attempts, [11, 12, 14, 13])
+            self.assertEqual(io.closed, [11, 12, 14])
+            self.assertLess(io.events.index("stat"), io.events.index("close:14"))
+            self.assertEqual(io.positional_requests, [])
+            self.assert_cleanup(io)
+            self.assert_policy("invalid_contract", source.borrow_fd)
+
+    def test_range_rejects_invalid_handle_and_bounds(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            reader = self.api(io.module, "_pinned_source", "_read_pinned_range")._read_pinned_range
+            budget = self.budget(io)
+            with self.owner(io, budget) as source:
+                for offset, length in (
+                    (-1, 1),
+                    (0, 0),
+                    (128, 1),
+                    (127, 2),
+                    (True, 1),
+                    (0, True),
+                    (0.0, 1),
+                    (0, 1.0),
+                    (self.IntegerSubclass(0), 1),
+                    (0, self.IntegerSubclass(1)),
+                ):
+                    with self.subTest(offset=offset, length=length):
+                        before = list(io.events)
+                        self.assert_policy(
+                            "invalid_contract", reader, source, offset=offset, length=length
+                        )
+                        self.assertEqual(io.events, before)
+                self.assert_policy("invalid_contract", reader, None, offset=0, length=1)
+            self.assert_policy("invalid_contract", reader, source, offset=0, length=1)
+            self.assertEqual(budget.total_read_bytes, 0)
+            self.assertEqual(io.positional_requests, [])
+        with _EnvelopeLoggedIO() as io:
+            reader = self.api(io.module, "_pinned_source", "_read_pinned_range")._read_pinned_range
+            with self.owner(io, None) as source:
+                self.assert_policy("invalid_contract", reader, source, offset=0, length=1)
+            self.assertEqual(io.positional_requests, [])
+
+    def test_range_single_request_preserves_bytes_identity(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            reader = self.api(io.module, "_pinned_source", "_read_pinned_range")._read_pinned_range
+            budget = self.budget(io)
+            expected = io.responses[(105, 15)]
+            with self.owner(io, budget) as source:
+                result = reader(source, offset=105, length=15)
+                self.assertIs(result, expected)
+            self.assertEqual(io.positional_requests, [(14, 15, 105)])
+            self.assertEqual(budget.total_read_bytes, 15)
+            self.assert_cleanup(io)
+
+    def test_range_prechecks_cumulative_and_request_caps(self) -> None:
+        for available in (14, 15):
+            with self.subTest(available=available), _EnvelopeLoggedIO() as io:
+                reader = self.api(
+                    io.module, "_pinned_source", "_read_pinned_range"
+                )._read_pinned_range
+                budget = self.budget(io, max_total_read_bytes=available + 3)
+                budget.record_read(3)
+                with self.owner(io, budget) as source:
+                    if available == 14:
+                        self.assert_policy("resource_limit", reader, source, offset=105, length=15)
+                        self.assertEqual(io.positional_requests, [])
+                        self.assertEqual(budget.total_read_bytes, 3)
+                    else:
+                        self.assertIs(reader(source, offset=105, length=15), _GRAMMAR_ANCHOR)
+                        self.assertEqual(budget.total_read_bytes, 18)
+        for requested in (1024 * 1024, 1024 * 1024 + 1):
+            with self.subTest(requested=requested), _EnvelopeLoggedIO() as io:
+                reader = self.api(
+                    io.module, "_pinned_source", "_read_pinned_range"
+                )._read_pinned_range
+                for metadata in (io.before, io.after, io.located):
+                    metadata.st_size = 2 * 1024 * 1024
+                io.responses[(0, requested)] = b"n"
+                budget = self.budget(io)
+                with self.owner(io, budget) as source:
+                    if requested == 1024 * 1024:
+                        self.assert_integrity(
+                            io,
+                            "incomplete bounded range",
+                            reader,
+                            source,
+                            offset=0,
+                            length=requested,
+                        )
+                        self.assertEqual(io.positional_requests, [(14, requested, 0)])
+                        self.assertEqual(budget.total_read_bytes, 1)
+                    else:
+                        self.assert_policy(
+                            "resource_limit", reader, source, offset=0, length=requested
+                        )
+                        self.assertEqual(io.positional_requests, [])
+                        self.assertEqual(budget.total_read_bytes, 0)
+
+    def test_range_short_or_zero_result_refuses_without_retry(self) -> None:
+        for payload in (b"", b"n"):
+            with self.subTest(size=len(payload)), _EnvelopeLoggedIO() as io:
+                reader = self.api(
+                    io.module, "_pinned_source", "_read_pinned_range"
+                )._read_pinned_range
+                io.responses[(105, 15)] = payload
+                budget = self.budget(io)
+                with self.owner(io, budget) as source:
+                    self.assert_integrity(
+                        io, "incomplete bounded range", reader, source, offset=105, length=15
+                    )
+                self.assertEqual(io.positional_requests, [(14, 15, 105)])
+                self.assertEqual(budget.total_read_bytes, len(payload))
+
+    def test_range_deadlines_and_os_failures_preserve_accounting(self) -> None:
+        for stage in ("before", "after", "os"):
+            with self.subTest(stage=stage), _EnvelopeLoggedIO() as io:
+                reader = self.api(
+                    io.module, "_pinned_source", "_read_pinned_range"
+                )._read_pinned_range
+                budget = self.budget(io)
+                failure = OSError("neutral pread failure")
+                with (
+                    self.assertRaises(OSError if stage == "os" else PinnedReadRefused) as raised,
+                    self.owner(io, budget) as source,
+                ):
+                    io.expired = stage == "before"
+                    io.expire_after = "pread:1" if stage == "after" else ""
+                    io.fail_pread = 1 if stage == "os" else 0
+                    io.pread_error = failure
+                    reader(source, offset=105, length=15)
+                if stage == "os":
+                    self.assertIs(raised.exception, failure)
+                else:
+                    self.assertEqual(raised.exception.reason_code, "deadline_exceeded")
+                self.assertEqual(len(io.positional_requests), 0 if stage == "before" else 1)
+                self.assertEqual(budget.total_read_bytes, 15 if stage == "after" else 0)
+                self.assert_cleanup(io)
+
+    def test_envelope_validates_new_contract_before_callbacks(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            reader = self.api(bounded_parquet, "_read_footer_envelope")._read_footer_envelope
+            budget = self.budget(io)
+            for name in ("maximum", "max_footer_bytes", "max_retained_payload_bytes"):
+                for invalid in (0, -1, True, 1.0, self.IntegerSubclass(1)):
+                    with self.subTest(name=name, value=invalid):
+                        self.assert_policy(
+                            "invalid_contract", self.envelope, io, budget, **{name: invalid}
+                        )
+                        self.assertEqual(io.events, [])
+            for root, identity, selected in (
+                (Path("relative"), io.identity, budget),
+                (io.root, io.module.PinnedParquetFile("neutral.parquet", "bad"), budget),
+                (io.root, io.identity, None),
+            ):
+                with self.subTest(root=root, valid_budget=selected is budget):
+                    self.assert_policy(
+                        "invalid_contract",
+                        reader,
+                        root,
+                        identity,
+                        maximum=128,
+                        max_footer_bytes=15,
+                        max_retained_payload_bytes=27,
+                        budget=selected,
+                    )
+                    self.assertEqual(io.events, [])
+
+    def test_envelope_exact_ranges_and_cumulative_receipt(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            self.api(
+                bounded_parquet,
+                "_read_footer_envelope",
+                "_FooterEnvelope",
+                "_FooterEnvelopeReceipt",
+            )
+            budget = self.budget(io)
+            budget.before_open()
+            budget.record_read(3)
+            envelope = self.envelope(io, budget, max_footer_bytes=15, max_retained_payload_bytes=27)
+            self.assertIs(envelope.payload, _GRAMMAR_ANCHOR)
+            self.assertEqual(
+                (
+                    envelope.extent.source_size,
+                    envelope.extent.footer_start,
+                    envelope.extent.footer_end,
+                ),
+                (128, 105, 120),
+            )
+            self.assertEqual(envelope.source_identity, (1, 2, 128, 3, 4))
+            self.assertIs(envelope.read_budget, budget)
+            receipt = envelope.receipt
+            self.assertEqual(
+                (
+                    receipt.source_opens_before,
+                    receipt.source_opens_after,
+                    receipt.total_read_bytes_before,
+                    receipt.total_read_bytes_after,
+                ),
+                (1, 5, 3, 30),
+            )
+            self.assertEqual(receipt.ranges, ((0, 4), (120, 128), (105, 120)))
+            self.assertIs(receipt.whole_source_digest_verified, False)
+            self.assertEqual(io.positional_requests, [(14, 4, 0), (14, 8, 120), (14, 15, 105)])
+            with self.assertRaises(FrozenInstanceError):
+                envelope.payload = b"n"
+            with self.assertRaises(FrozenInstanceError):
+                receipt.whole_source_digest_verified = True
+            self.assert_cleanup(io)
+
+    def test_envelope_prechecks_framing_and_footer_allowances(self) -> None:
+        cases = (
+            (11, 100, 100, 0),
+            (100, 11, 100, 0),
+            (26, 100, 100, 2),
+            (100, 26, 100, 2),
+            (100, 100, 14, 2),
+        )
+        for read_cap, retained, footer_cap, expected_calls in cases:
+            with self.subTest(caps=(read_cap, retained, footer_cap)), _EnvelopeLoggedIO() as io:
+                self.api(bounded_parquet, "_read_footer_envelope")
+                budget = self.budget(io, max_total_read_bytes=read_cap)
+                self.assert_policy(
+                    "resource_limit",
+                    self.envelope,
+                    io,
+                    budget,
+                    max_footer_bytes=footer_cap,
+                    max_retained_payload_bytes=retained,
+                )
+                self.assertEqual(len(io.positional_requests), expected_calls)
+                self.assertEqual(budget.total_read_bytes, 12 if expected_calls else 0)
+                self.assert_cleanup(io)
+
+    def test_envelope_rejects_invalid_length_extents(self) -> None:
+        for size in (1, 11):
+            with self.subTest(source_size=size), _EnvelopeLoggedIO() as io:
+                self.api(bounded_parquet, "_read_footer_envelope")
+                for metadata in (io.before, io.after, io.located):
+                    metadata.st_size = size
+                self.assert_integrity(io, "footer envelope length", self.envelope, io)
+                self.assertEqual(io.positional_requests, [])
+                self.assert_cleanup(io)
+        for length in (0, 117, 2**32 - 1):
+            with self.subTest(footer_length=length), _EnvelopeLoggedIO() as io:
+                self.api(bounded_parquet, "_read_footer_envelope")
+                io.responses[(120, 8)] = length.to_bytes(4, "little") + b"PAR1"
+                self.assert_integrity(io, "footer envelope length", self.envelope, io)
+                self.assertEqual(len(io.positional_requests), 2)
+                self.assert_cleanup(io)
+
+    def test_envelope_read_failures_prevent_construction(self) -> None:
+        for stage in (1, 2, 3):
+            for failure_kind in ("os", "positive_short", "zero_short", "deadline"):
+                with self.subTest(stage=stage, failure=failure_kind), _EnvelopeLoggedIO() as io:
+                    self.api(
+                        bounded_parquet,
+                        "_read_footer_envelope",
+                        "_FooterEnvelope",
+                        "_FooterEnvelopeReceipt",
+                    )
+                    failure = OSError("neutral envelope read failure")
+                    ranges = ((0, 4), (120, 8), (105, 15))
+                    completed_bytes = (0, 4, 12)[stage - 1]
+                    returned_bytes = ranges[stage - 1][1]
+                    error_type = io.module.TimestampMetadataRefused
+                    if failure_kind == "os":
+                        io.fail_pread = stage
+                        io.pread_error = failure
+                        returned_bytes = 0
+                        error_type = OSError
+                    elif failure_kind == "deadline":
+                        io.expire_after = f"pread:{stage}"
+                        error_type = PinnedReadRefused
+                    else:
+                        payload = b"n" if failure_kind == "positive_short" else b""
+                        io.responses[ranges[stage - 1]] = payload
+                        returned_bytes = len(payload)
+                    budget = self.budget(io)
+                    with (
+                        patch.object(
+                            bounded_parquet,
+                            "_FooterEnvelope",
+                            side_effect=AssertionError("failed read published envelope"),
+                        ) as constructor,
+                        patch.object(
+                            bounded_parquet,
+                            "_FooterEnvelopeReceipt",
+                            side_effect=AssertionError("failed read published receipt"),
+                        ) as receipt,
+                        self.assertRaises(error_type) as raised,
+                    ):
+                        self.envelope(io, budget)
+                    if failure_kind == "os":
+                        self.assertIs(raised.exception, failure)
+                    elif failure_kind == "deadline":
+                        self.assertEqual(raised.exception.reason_code, "deadline_exceeded")
+                    else:
+                        self.assertEqual(str(raised.exception), "incomplete bounded range")
+                    constructor.assert_not_called()
+                    receipt.assert_not_called()
+                    self.assertEqual(
+                        io.positional_requests,
+                        [(14, length, offset) for offset, length in ranges[:stage]],
+                    )
+                    self.assertEqual(budget.total_read_bytes, completed_bytes + returned_bytes)
+                    self.assert_cleanup(io)
+
+    def test_envelope_identity_close_and_unknown_digest(self) -> None:
+        for outcome in ("success", "identity", "close"):
+            with self.subTest(outcome=outcome), _EnvelopeLoggedIO() as io:
+                api = self.api(
+                    bounded_parquet,
+                    "_read_footer_envelope",
+                    "_FooterEnvelope",
+                    "_FooterEnvelopeReceipt",
+                )
+                private_payload = b"neutral-opaque-footer-sentinel"
+                footer_length = len(private_payload)
+                io.responses[(120, 8)] = footer_length.to_bytes(4, "little") + b"PAR1"
+                io.responses[(120 - footer_length, footer_length)] = private_payload
+                if outcome == "identity":
+                    io.after.st_ino += 1
+                if outcome == "close":
+                    io.close_errors[14] = OSError("neutral close refusal")
+                constructions = []
+
+                def envelope_record(
+                    *args, io=io, constructions=constructions, record=api._FooterEnvelope, **kwargs
+                ):
+                    self.assert_cleanup(io)
+                    self.assertIn("stat", io.events)
+                    constructions.append("envelope")
+                    return record(*args, **kwargs)
+
+                def receipt_record(
+                    *args,
+                    io=io,
+                    constructions=constructions,
+                    record=api._FooterEnvelopeReceipt,
+                    **kwargs,
+                ):
+                    self.assert_cleanup(io)
+                    constructions.append("receipt")
+                    return record(*args, **kwargs)
+
+                with (
+                    patch.object(bounded_parquet, "_FooterEnvelope", side_effect=envelope_record),
+                    patch.object(
+                        bounded_parquet, "_FooterEnvelopeReceipt", side_effect=receipt_record
+                    ),
+                ):
+                    if outcome == "success":
+                        envelope = self.envelope(io)
+                        self.assertIs(envelope.receipt.whole_source_digest_verified, False)
+                        self.assertIs(envelope.payload, private_payload)
+                        self.assertEqual(constructions, ["receipt", "envelope"])
+                        for name in ("fd", "path", "header", "trailer"):
+                            self.assertFalse(hasattr(envelope, name))
+                        for record in (envelope, envelope.receipt):
+                            for private in (
+                                private_payload.decode("ascii"),
+                                str(io.root),
+                                io.relative_path,
+                                "neutral.parquet",
+                                str(envelope.source_identity),
+                            ):
+                                self.assertNotIn(private, repr(record))
+                    else:
+                        with self.assertRaises(
+                            OSError if outcome == "close" else io.module.TimestampMetadataRefused
+                        ):
+                            self.envelope(io)
+                        self.assertEqual(constructions, [])
+                self.assert_cleanup(io)
+
+    def test_envelope_magic_controls_refusal_stage(self) -> None:
+        for position, value, expected_calls in (
+            ("head", b"PARE", 1),
+            ("tail", b"PARE", 2),
+            ("head", b"nope", 1),
+            ("tail", b"nope", 2),
+        ):
+            with self.subTest(position=position, value=value), _EnvelopeLoggedIO() as io:
+                self.api(bounded_parquet, "_read_footer_envelope")
+                if position == "head":
+                    io.responses[(0, 4)] = value
+                else:
+                    io.responses[(120, 8)] = bytes.fromhex("0f 00 00 00") + value
+                if value == b"PARE":
+                    self.assert_policy("unsupported_mode", self.envelope, io)
+                else:
+                    self.assert_integrity(io, "footer envelope magic", self.envelope, io)
+                self.assertEqual(len(io.positional_requests), expected_calls)
+                self.assert_cleanup(io)
+
+    def test_envelope_preserves_bounded_refusal_types(self) -> None:
+        for metadata in ({"st_mode": stat.S_IFDIR | 0o700}, {"st_nlink": 2}, {"st_size": 0}):
+            with self.subTest(metadata=metadata), _EnvelopeLoggedIO() as io:
+                self.api(bounded_parquet, "_read_footer_envelope")
+                io.before = io.metadata(**metadata)
+                with self.assertRaises(io.module.TimestampMetadataRefused):
+                    self.envelope(io)
+                self.assertEqual(io.positional_requests, [])
+                self.assert_cleanup(io)
+        with _EnvelopeLoggedIO() as io:
+            self.api(bounded_parquet, "_read_footer_envelope")
+            io.responses[(120, 8)] = b"n"
+            budget = self.budget(io)
+            self.assert_integrity(io, "incomplete bounded range", self.envelope, io, budget)
+            self.assertEqual(budget.total_read_bytes, 5)
+            self.assert_cleanup(io)
+
+    def test_footer_extra_tail_refuses_without_retry_or_signature_claim(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            function = self.continuation()
+            self.api(bounded_parquet, "_read_footer_envelope")
+            io.responses[(120, 8)] = bytes.fromhex("10 00 00 00 50 41 52 31")
+            io.responses[(104, 16)] = _GRAMMAR_ANCHOR + b"\x00"
+            envelope = self.envelope(io)
+            before = list(io.positional_requests)
+            with self.assertRaises(bounded_parquet._CompactWireMalformed) as raised:
+                function(envelope, budget=FooterGrammarTests().budget())
+            self.assertEqual(raised.exception.reason_code, "invalid_wire")
+            self.assertEqual(io.positional_requests, before)
+            self.assert_cleanup(io)
+
+    def test_footer_continuation_preserves_payload_and_budget_identity(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            function = self.continuation()
+            envelope = self.envelope(io)
+            budget = FooterGrammarTests().budget()
+            budget.reserve(bounded_parquet._FooterCharge(semantic_work_units=3))
+            budget.wire_budget._reserve(work_units=2)
+            profile = function(envelope, budget=budget)
+            self.assertIs(profile.document.payload, envelope.payload)
+            self.assertIs(profile.document.budget, budget)
+            self.assertIs(profile.document.budget.wire_budget, budget.wire_budget)
+            self.assertGreater(budget.semantic_work_units, 3)
+            self.assertGreater(budget.wire_budget.work_units, 2)
+            self.assertIs(profile.read_eligible, False)
+            self.assertGreaterEqual(profile.flags, FooterProfileTests.MANDATORY)
+            self.assertEqual(len(io.positional_requests), 3)
+            self.assert_cleanup(io)
+
+    def test_footer_continuation_starts_after_source_closure(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            function = self.continuation()
+            envelope = self.envelope(io)
+            parser = bounded_parquet._parse_footer
+            calls = []
+
+            def observed(cursor, extent, budget):
+                self.assert_cleanup(io)
+                self.assertIn("stat", io.events)
+                self.assertIs(cursor.payload, envelope.payload)
+                self.assertEqual((cursor.start, cursor.stop), (0, 15))
+                self.assertIs(extent, envelope.extent)
+                self.assertIs(cursor.budget, budget.wire_budget)
+                calls.append("parse")
+                return parser(cursor, extent, budget)
+
+            with patch.object(bounded_parquet, "_parse_footer", side_effect=observed):
+                result = function(envelope, budget=FooterGrammarTests().budget())
+            self.assertEqual(calls, ["parse"])
+            self.assertIs(result.document.payload, envelope.payload)
+
+    def test_footer_continuation_rejects_invalid_entry_contracts(self) -> None:
+        with _EnvelopeLoggedIO() as io:
+            function = self.continuation()
+            envelope = self.envelope(io)
+            budget = FooterGrammarTests().budget()
+            invalids = (
+                None,
+                replace(envelope, payload="n"),
+                replace(envelope, payload=b"n"),
+                replace(envelope, read_budget=None),
+                replace(
+                    envelope, receipt=replace(envelope.receipt, whole_source_digest_verified=True)
+                ),
+            )
+            for invalid in invalids:
+                with (
+                    self.subTest(invalid_type=type(invalid).__name__),
+                    patch.object(
+                        bounded_parquet,
+                        "_parse_footer",
+                        side_effect=AssertionError("invalid continuation parsed"),
+                    ) as parser,
+                ):
+                    self.assert_policy("invalid_contract", function, invalid, budget=budget)
+                    parser.assert_not_called()
+            with patch.object(
+                bounded_parquet,
+                "_parse_footer",
+                side_effect=AssertionError("invalid budget parsed"),
+            ):
+                self.assert_policy("invalid_contract", function, envelope, budget=None)
+
+    def test_footer_continuation_preserves_failures_without_output(self) -> None:
+        for stage in ("parse", "profile", "before", "between", "after"):
+            with self.subTest(stage=stage), _EnvelopeLoggedIO() as io:
+                function = self.continuation()
+                envelope = self.envelope(io)
+                parse = bounded_parquet._parse_footer
+                complete = bounded_parquet._complete_footer_profile
+                failure = bounded_parquet._CompactWireMalformed("schema_mismatch")
+                calls = []
+
+                def observed_parse(
+                    *args, calls=calls, stage=stage, failure=failure, parse=parse, io=io, **kwargs
+                ):
+                    calls.append("parse")
+                    if stage == "parse":
+                        raise failure
+                    result = parse(*args, **kwargs)
+                    if stage == "between":
+                        io.expired = True
+                    return result
+
+                def observed_profile(
+                    *args,
+                    calls=calls,
+                    stage=stage,
+                    failure=failure,
+                    complete=complete,
+                    io=io,
+                    **kwargs,
+                ):
+                    calls.append("profile")
+                    if stage == "profile":
+                        raise failure
+                    result = complete(*args, **kwargs)
+                    if stage == "after":
+                        io.expired = True
+                    return result
+
+                io.expired = stage == "before"
+                with (
+                    patch.object(bounded_parquet, "_parse_footer", side_effect=observed_parse),
+                    patch.object(
+                        bounded_parquet, "_complete_footer_profile", side_effect=observed_profile
+                    ),
+                ):
+                    with self.assertRaises(
+                        bounded_parquet._CompactWireMalformed
+                        if stage in ("parse", "profile")
+                        else PinnedReadRefused
+                    ) as raised:
+                        function(envelope, budget=FooterGrammarTests().budget())
+                    if stage in ("parse", "profile"):
+                        self.assertIs(raised.exception, failure)
+                    else:
+                        self.assertEqual(raised.exception.reason_code, "deadline_exceeded")
+                self.assertEqual(
+                    calls,
+                    []
+                    if stage == "before"
+                    else ["parse"]
+                    if stage in ("parse", "between")
+                    else ["parse", "profile"],
+                )
+                self.assertEqual(len(io.positional_requests), 3)
+
+    def test_footer_continuation_consumes_remaining_budgets(self) -> None:
+        for axis in ("wire", "semantic"):
+            with self.subTest(axis=axis), _EnvelopeLoggedIO() as io:
+                function = self.continuation()
+                envelope = self.envelope(io)
+                budget = FooterGrammarTests().budget()
+                if axis == "semantic":
+                    budget.reserve(
+                        bounded_parquet._FooterCharge(
+                            semantic_work_units=budget.limits.max_semantic_work_units
+                        )
+                    )
+                else:
+                    budget.wire_budget._reserve(
+                        wire_bytes=budget.wire_budget.limits.max_total_wire_bytes
+                    )
+                with patch.object(
+                    bounded_parquet,
+                    "_complete_footer_profile",
+                    side_effect=AssertionError("exhausted parse completed Profile"),
+                ) as profile:
+                    self.assert_policy("resource_limit", function, envelope, budget=budget)
+                    profile.assert_not_called()
+                if axis == "semantic":
+                    self.assertEqual(
+                        budget.semantic_work_units, budget.limits.max_semantic_work_units
+                    )
+                else:
+                    self.assertEqual(
+                        budget.wire_budget.total_wire_bytes,
+                        budget.wire_budget.limits.max_total_wire_bytes,
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

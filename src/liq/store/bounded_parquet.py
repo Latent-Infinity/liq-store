@@ -2372,3 +2372,123 @@ def _footer_profile_groups(
             )
         )
     return chunks
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _FooterEnvelopeReceipt:
+    source_opens_before: int
+    source_opens_after: int
+    total_read_bytes_before: int
+    total_read_bytes_after: int
+    ranges: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+    whole_source_digest_verified: Literal[False]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _FooterEnvelope:
+    payload: bytes
+    extent: _FooterExtent
+    source_identity: tuple[int, int, int, int, int]
+    receipt: _FooterEnvelopeReceipt
+    read_budget: _PinnedReadBudget = _footer_record_field(repr=False, compare=False)
+
+
+def _read_footer_envelope(
+    root: Path,
+    identity: PinnedParquetFile,
+    *,
+    maximum: int,
+    max_footer_bytes: int,
+    max_retained_payload_bytes: int,
+    budget: _PinnedReadBudget,
+) -> _FooterEnvelope:
+    from liq.store.timestamp_metadata import (
+        TimestampMetadataRefused,
+        _pinned_source,
+        _read_pinned_range,
+    )
+
+    if (
+        type(maximum) is not int
+        or maximum <= 0
+        or type(max_footer_bytes) is not int
+        or max_footer_bytes <= 0
+        or type(max_retained_payload_bytes) is not int
+        or max_retained_payload_bytes <= 0
+        or type(budget) is not _PinnedReadBudget
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    opens_before = budget.source_opens
+    bytes_before = budget.total_read_bytes
+    with _pinned_source(root, identity, maximum, budget=budget) as source:
+        size = source.size
+        if size < 12:
+            raise TimestampMetadataRefused("footer envelope length")
+        if (
+            max_retained_payload_bytes < 12
+            or budget.limits.max_total_read_bytes - budget.total_read_bytes < 12
+        ):
+            raise PinnedReadRefused("resource_limit")
+        leading = _read_pinned_range(source, offset=0, length=4)
+        if leading != b"PAR1":
+            if leading == b"PARE":
+                raise PinnedReadRefused("unsupported_mode")
+            raise TimestampMetadataRefused("footer envelope magic")
+        trailer_start = size - 8
+        trailing = _read_pinned_range(source, offset=trailer_start, length=8)
+        if not (
+            trailing[4] == 80 and trailing[5] == 65 and trailing[6] == 82 and trailing[7] == 49
+        ):
+            if trailing[4] == 80 and trailing[5] == 65 and trailing[6] == 82 and trailing[7] == 69:
+                raise PinnedReadRefused("unsupported_mode")
+            raise TimestampMetadataRefused("footer envelope magic")
+        footer_length = trailing[0] | (trailing[1] << 8) | (trailing[2] << 16) | (trailing[3] << 24)
+        footer_start = trailer_start - footer_length
+        if footer_length == 0 or footer_start < 4:
+            raise TimestampMetadataRefused("footer envelope length")
+        if (
+            footer_length > max_footer_bytes
+            or footer_length + 12 > max_retained_payload_bytes
+            or footer_length > budget.limits.max_total_read_bytes - budget.total_read_bytes
+        ):
+            raise PinnedReadRefused("resource_limit")
+        payload = _read_pinned_range(source, offset=footer_start, length=footer_length)
+        source_identity = source.identity
+    extent = _FooterExtent(size, footer_start, trailer_start)
+    receipt = _FooterEnvelopeReceipt(
+        opens_before,
+        budget.source_opens,
+        bytes_before,
+        budget.total_read_bytes,
+        ((0, 4), (trailer_start, size), (footer_start, trailer_start)),
+        False,
+    )
+    return _FooterEnvelope(payload, extent, source_identity, receipt, budget)
+
+
+def _profile_footer_envelope(envelope: _FooterEnvelope, *, budget: _FooterBudget) -> _FooterProfile:
+    if (
+        type(envelope) is not _FooterEnvelope
+        or type(envelope.payload) is not bytes
+        or type(envelope.extent) is not _FooterExtent
+        or type(envelope.receipt) is not _FooterEnvelopeReceipt
+        or envelope.receipt.whole_source_digest_verified is not False
+        or type(envelope.read_budget) is not _PinnedReadBudget
+        or type(budget) is not _FooterBudget
+        or type(budget.wire_budget) is not _CompactWireBudget
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    envelope.extent.__post_init__()
+    if len(envelope.payload) != envelope.extent.footer_end - envelope.extent.footer_start:
+        raise PinnedReadRefused("invalid_contract")
+    budget.limits.__post_init__()
+    budget.wire_budget.limits.__post_init__()
+    envelope.read_budget.check_deadline()
+    cursor = _CompactWireCursor(
+        envelope.payload, 0, len(envelope.payload), budget.wire_budget, kind="footer"
+    )
+    document = _parse_footer(cursor, envelope.extent, budget)
+    envelope.read_budget.check_deadline()
+    profile = _complete_footer_profile(document)
+    envelope.read_budget.check_deadline()
+    return profile
