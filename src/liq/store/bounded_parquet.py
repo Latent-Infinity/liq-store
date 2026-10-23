@@ -2588,3 +2588,451 @@ class _PageBudget:
                 declaration.name,
                 getattr(self, declaration.name) + getattr(charge, declaration.name),
             )
+
+
+@dataclass(frozen=True, slots=True)
+class _PageHeaderAdmission:
+    header_start: int
+    header_end: int
+    body_start: int
+    body_end: int
+    compressed_page_size: int
+    uncompressed_page_size: int
+    page_type: int
+    crc: int | None
+    detail: _PageDataV1Header | _PageIndexHeader | _PageDictionaryHeader | _PageDataV2Header
+    payload: bytes | None
+    decode_eligible: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PageDataV1Header:
+    num_values: int
+    encoding: int
+    definition_level_encoding: int
+    repetition_level_encoding: int
+    statistics: _PageStatistics | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PageIndexHeader:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _PageDictionaryHeader:
+    num_values: int
+    encoding: int
+    is_sorted: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PageDataV2Header:
+    num_values: int
+    num_nulls: int
+    num_rows: int
+    encoding: int
+    definition_levels_byte_length: int
+    repetition_levels_byte_length: int
+    is_compressed: bool | None
+    effective_is_compressed: bool
+    statistics: _PageStatistics | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PageStatistics:
+    max: tuple[int, int] | None
+    min: tuple[int, int] | None
+    null_count: int | None
+    distinct_count: int | None
+    max_value: tuple[int, int] | None
+    min_value: tuple[int, int] | None
+    is_max_value_exact: bool | None
+    is_min_value_exact: bool | None
+
+
+def _page_work(budget: _PageBudget) -> None:
+    budget.reserve(_PageCharge(work_units=1))
+
+
+def _page_required(value: int | None) -> int:
+    if value is None:
+        raise _CompactWireMalformed("schema_mismatch")
+    return value
+
+
+def _page_count(value: int | None) -> int:
+    count = _page_required(value)
+    if count < 0:
+        raise _CompactWireMalformed("schema_mismatch")
+    return count
+
+
+def _page_encoding(value: int | None) -> int:
+    encoding = _page_required(value)
+    if encoding not in (0, 2, 3, 4, 5, 6, 7, 8, 9):
+        raise PinnedReadRefused("unsupported_mode")
+    return encoding
+
+
+def _read_page_statistics(cursor: _CompactWireCursor, budget: _PageBudget) -> _PageStatistics:
+    maximum: tuple[int, int] | None = None
+    minimum: tuple[int, int] | None = None
+    null_count: int | None = None
+    distinct_count: int | None = None
+    max_value: tuple[int, int] | None = None
+    min_value: tuple[int, int] | None = None
+    max_exact: bool | None = None
+    min_exact: bool | None = None
+    grammar = {
+        1: "binary",
+        2: "binary",
+        3: "i64",
+        4: "i64",
+        5: "binary",
+        6: "binary",
+        7: "bool",
+        8: "bool",
+    }
+    _page_work(budget)
+    cursor.begin_struct()
+    while True:
+        _page_work(budget)
+        field = cursor.read_field(grammar)
+        if field is None:
+            break
+        _page_work(budget)
+        match field.field_id:
+            case 1:
+                maximum = cursor.read_binary_span()
+            case 2:
+                minimum = cursor.read_binary_span()
+            case 3:
+                null_count = _page_count(cursor.read_i64())
+            case 4:
+                distinct_count = _page_count(cursor.read_i64())
+            case 5:
+                max_value = cursor.read_binary_span()
+            case 6:
+                min_value = cursor.read_binary_span()
+            case 7:
+                max_exact = cursor.read_bool()
+            case 8:
+                min_exact = cursor.read_bool()
+            case _:
+                raise _CompactWireMalformed("schema_mismatch")
+    _page_work(budget)
+    cursor.end_struct()
+    _page_work(budget)
+    return _PageStatistics(
+        maximum, minimum, null_count, distinct_count, max_value, min_value, max_exact, min_exact
+    )
+
+
+def _read_page_data_v1(cursor: _CompactWireCursor, budget: _PageBudget) -> _PageDataV1Header:
+    num_values: int | None = None
+    encoding: int | None = None
+    definition: int | None = None
+    repetition: int | None = None
+    statistics: _PageStatistics | None = None
+    grammar = {1: "i32", 2: "i32", 3: "i32", 4: "i32", 5: "struct"}
+    _page_work(budget)
+    cursor.begin_struct()
+    while True:
+        _page_work(budget)
+        field = cursor.read_field(grammar)
+        if field is None:
+            break
+        match field.field_id:
+            case 1 | 2 | 3 | 4:
+                _page_work(budget)
+                value = cursor.read_i32()
+                match field.field_id:
+                    case 1:
+                        num_values = value
+                    case 2:
+                        encoding = value
+                    case 3:
+                        definition = value
+                    case 4:
+                        repetition = value
+                    case _:
+                        raise _CompactWireMalformed("schema_mismatch")
+            case 5:
+                statistics = _read_page_statistics(cursor, budget)
+            case _:
+                raise _CompactWireMalformed("schema_mismatch")
+    _page_work(budget)
+    cursor.end_struct()
+    values = _page_count(num_values)
+    value_encoding = _page_encoding(encoding)
+    definition_encoding = _page_encoding(definition)
+    repetition_encoding = _page_encoding(repetition)
+    _page_work(budget)
+    return _PageDataV1Header(
+        values, value_encoding, definition_encoding, repetition_encoding, statistics
+    )
+
+
+def _read_page_index(cursor: _CompactWireCursor, budget: _PageBudget) -> _PageIndexHeader:
+    _page_work(budget)
+    cursor.begin_struct()
+    _page_work(budget)
+    if cursor.read_field({}) is not None:
+        raise _CompactWireMalformed("schema_mismatch")
+    _page_work(budget)
+    cursor.end_struct()
+    _page_work(budget)
+    return _PageIndexHeader()
+
+
+def _read_page_dictionary(cursor: _CompactWireCursor, budget: _PageBudget) -> _PageDictionaryHeader:
+    num_values: int | None = None
+    encoding: int | None = None
+    is_sorted: bool | None = None
+    grammar = {1: "i32", 2: "i32", 3: "bool"}
+    _page_work(budget)
+    cursor.begin_struct()
+    while True:
+        _page_work(budget)
+        field = cursor.read_field(grammar)
+        if field is None:
+            break
+        _page_work(budget)
+        match field.field_id:
+            case 1:
+                num_values = cursor.read_i32()
+            case 2:
+                encoding = cursor.read_i32()
+            case 3:
+                is_sorted = cursor.read_bool()
+            case _:
+                raise _CompactWireMalformed("schema_mismatch")
+    _page_work(budget)
+    cursor.end_struct()
+    values = _page_count(num_values)
+    value_encoding = _page_encoding(encoding)
+    _page_work(budget)
+    return _PageDictionaryHeader(values, value_encoding, is_sorted)
+
+
+def _read_page_data_v2(cursor: _CompactWireCursor, budget: _PageBudget) -> _PageDataV2Header:
+    num_values: int | None = None
+    num_nulls: int | None = None
+    num_rows: int | None = None
+    encoding: int | None = None
+    definition: int | None = None
+    repetition: int | None = None
+    is_compressed: bool | None = None
+    statistics: _PageStatistics | None = None
+    grammar = {
+        1: "i32",
+        2: "i32",
+        3: "i32",
+        4: "i32",
+        5: "i32",
+        6: "i32",
+        7: "bool",
+        8: "struct",
+    }
+    _page_work(budget)
+    cursor.begin_struct()
+    while True:
+        _page_work(budget)
+        field = cursor.read_field(grammar)
+        if field is None:
+            break
+        match field.field_id:
+            case 1 | 2 | 3 | 4 | 5 | 6:
+                _page_work(budget)
+                value = cursor.read_i32()
+                match field.field_id:
+                    case 1:
+                        num_values = value
+                    case 2:
+                        num_nulls = value
+                    case 3:
+                        num_rows = value
+                    case 4:
+                        encoding = value
+                    case 5:
+                        definition = value
+                    case 6:
+                        repetition = value
+                    case _:
+                        raise _CompactWireMalformed("schema_mismatch")
+            case 7:
+                _page_work(budget)
+                is_compressed = cursor.read_bool()
+            case 8:
+                statistics = _read_page_statistics(cursor, budget)
+            case _:
+                raise _CompactWireMalformed("schema_mismatch")
+    _page_work(budget)
+    cursor.end_struct()
+    values = _page_count(num_values)
+    nulls = _page_count(num_nulls)
+    rows = _page_count(num_rows)
+    value_encoding = _page_encoding(encoding)
+    definition_length = _page_count(definition)
+    repetition_length = _page_count(repetition)
+    if nulls > values or rows > values:
+        raise _CompactWireMalformed("schema_mismatch")
+    _page_work(budget)
+    return _PageDataV2Header(
+        values,
+        nulls,
+        rows,
+        value_encoding,
+        definition_length,
+        repetition_length,
+        is_compressed,
+        is_compressed is not False,
+        statistics,
+    )
+
+
+def _admit_page_header(
+    cursor: _CompactWireCursor, *, chunk_remaining_bytes: int, budget: _PageBudget
+) -> _PageHeaderAdmission:
+    """Admit one bounded header and declared workload, without admitting body decoding."""
+    if (
+        type(cursor) is not _CompactWireCursor
+        or type(budget) is not _PageBudget
+        or type(chunk_remaining_bytes) is not int
+        or chunk_remaining_bytes < 0
+        or cursor.kind != "page_header"
+        or cursor.position != cursor.start
+        or cursor._structs
+        or cursor._pending_bool is not None
+        or cursor.budget is not budget.wire_budget
+        or cursor.stop - cursor.start > chunk_remaining_bytes
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    budget.reserve(_PageCharge(pages=1))
+    page_type: int | None = None
+    uncompressed: int | None = None
+    compressed: int | None = None
+    crc: int | None = None
+    detail: (
+        _PageDataV1Header | _PageIndexHeader | _PageDictionaryHeader | _PageDataV2Header | None
+    ) = None
+    detail_type: int | None = None
+    data_v1: _PageDataV1Header | None = None
+    dictionary: _PageDictionaryHeader | None = None
+    data_v2: _PageDataV2Header | None = None
+    grammar = {
+        1: "i32",
+        2: "i32",
+        3: "i32",
+        4: "i32",
+        5: "struct",
+        6: "struct",
+        7: "struct",
+        8: "struct",
+    }
+    _page_work(budget)
+    cursor.begin_struct()
+    while True:
+        _page_work(budget)
+        field = cursor.read_field(grammar)
+        if field is None:
+            break
+        if field.field_id >= 5 and detail is not None:
+            raise _CompactWireMalformed("schema_mismatch")
+        match field.field_id:
+            case 1 | 2 | 3 | 4:
+                _page_work(budget)
+                value = cursor.read_i32()
+                match field.field_id:
+                    case 1:
+                        page_type = value
+                    case 2:
+                        uncompressed = value
+                    case 3:
+                        compressed = value
+                    case 4:
+                        crc = value
+                    case _:
+                        raise _CompactWireMalformed("schema_mismatch")
+            case 5:
+                data_v1 = _read_page_data_v1(cursor, budget)
+                detail, detail_type = data_v1, 0
+            case 6:
+                detail, detail_type = _read_page_index(cursor, budget), 1
+            case 7:
+                dictionary = _read_page_dictionary(cursor, budget)
+                detail, detail_type = dictionary, 2
+            case 8:
+                data_v2 = _read_page_data_v2(cursor, budget)
+                detail, detail_type = data_v2, 3
+            case _:
+                raise _CompactWireMalformed("schema_mismatch")
+    _page_work(budget)
+    cursor.end_struct()
+    _page_work(budget)
+    cursor.finish(require_exhausted=False)
+    kind = _page_required(page_type)
+    if kind not in (0, 1, 2, 3):
+        raise PinnedReadRefused("unsupported_mode")
+    uncompressed_size = _page_count(uncompressed)
+    compressed_size = _page_count(compressed)
+    if detail is None or detail_type != kind:
+        raise _CompactWireMalformed("schema_mismatch")
+    values = 0
+    dictionary_entries = 0
+    dictionary_payload_bytes = 0
+    statistics: _PageStatistics | None = None
+    if data_v1 is not None:
+        values, statistics = data_v1.num_values, data_v1.statistics
+    if dictionary is not None:
+        dictionary_entries = dictionary.num_values
+        dictionary_payload_bytes = uncompressed_size
+    if data_v2 is not None:
+        for size in (compressed_size, uncompressed_size):
+            if (
+                data_v2.definition_levels_byte_length > size
+                or data_v2.repetition_levels_byte_length
+                > size - data_v2.definition_levels_byte_length
+            ):
+                raise _CompactWireMalformed("schema_mismatch")
+        if not data_v2.effective_is_compressed and compressed_size != uncompressed_size:
+            raise _CompactWireMalformed("schema_mismatch")
+        values, statistics = data_v2.num_values, data_v2.statistics
+    header_bytes = cursor.position - cursor.start
+    if (
+        header_bytes > chunk_remaining_bytes
+        or compressed_size > chunk_remaining_bytes - header_bytes
+    ):
+        raise _CompactWireMalformed("truncated_wire")
+    payload = None
+    if statistics is not None and any(
+        span is not None
+        for span in (statistics.max, statistics.min, statistics.max_value, statistics.min_value)
+    ):
+        payload = cursor.payload
+    _page_work(budget)
+    body_end = cursor.position + compressed_size
+    budget.reserve(
+        _PageCharge(
+            compressed_bytes=compressed_size,
+            uncompressed_bytes=uncompressed_size,
+            values=values,
+            dictionary_entries=dictionary_entries,
+            dictionary_payload_bytes=dictionary_payload_bytes,
+        )
+    )
+    _page_work(budget)
+    return _PageHeaderAdmission(
+        header_start=cursor.start,
+        header_end=cursor.position,
+        body_start=cursor.position,
+        body_end=body_end,
+        compressed_page_size=compressed_size,
+        uncompressed_page_size=uncompressed_size,
+        page_type=kind,
+        crc=crc,
+        detail=detail,
+        payload=payload,
+        decode_eligible=False,
+    )

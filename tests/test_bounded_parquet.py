@@ -5470,5 +5470,878 @@ class PageBudgetTests(unittest.TestCase):
         self.assertEqual(self.state(budget), (4,) * 12)
 
 
+class PageHeaderAdmissionTests(unittest.TestCase):
+    body_axes = (
+        "compressed_bytes",
+        "uncompressed_bytes",
+        "values",
+        "dictionary_entries",
+        "dictionary_payload_bytes",
+    )
+
+    def api(self) -> SimpleNamespace:
+        names = (
+            "_admit_page_header",
+            "_PageHeaderAdmission",
+            "_PageDataV1Header",
+            "_PageIndexHeader",
+            "_PageDictionaryHeader",
+            "_PageDataV2Header",
+            "_PageStatistics",
+        )
+        found = {}
+        for name in names:
+            value = getattr(bounded_parquet, name, None)
+            self.assertTrue(callable(value), f"missing callable {name}")
+            found[name] = value
+        return SimpleNamespace(**found)
+
+    def detail_fields(self, kind: int) -> tuple[tuple[int, str, bytes], ...]:
+        declarations = {
+            0: ((1, 3), (2, 8), (3, 3), (4, 4)),
+            1: (),
+            2: ((1, 2), (2, 2)),
+            3: ((1, 3), (2, 1), (3, 2), (4, 9), (5, 2), (6, 3)),
+        }
+        return tuple((field, "i32", _grammar_integer(value)) for field, value in declarations[kind])
+
+    def root_fields(
+        self,
+        kind: int,
+        *,
+        detail=None,
+        compressed: int = 7,
+        uncompressed: int = 11,
+        crc: int | None = None,
+    ) -> tuple[tuple[int, str, bytes], ...]:
+        fields = (
+            (1, "i32", _grammar_integer(kind)),
+            (2, "i32", _grammar_integer(uncompressed)),
+            (3, "i32", _grammar_integer(compressed)),
+        )
+        if crc is not None:
+            fields += ((4, "i32", _grammar_integer(crc)),)
+        body = self.detail_fields(kind) if detail is None else detail
+        return fields + (((5, 6, 7, 8)[kind], "struct", _grammar_structure(body)),)
+
+    def wire(self, kind: int, **changes) -> bytes:
+        return _grammar_structure(self.root_fields(kind, **changes))
+
+    def context(
+        self, payload: bytes, *, start: int = 0, stop: int | None = None, page=None, wire=None
+    ) -> tuple[bounded_parquet._CompactWireCursor, bounded_parquet._PageBudget]:
+        page_limits = dict.fromkeys(("max_" + axis for axis in PageBudgetTests.axes), 1 << 33)
+        page_limits.update(page or {})
+        budget = PageBudgetTests().budget(**page_limits)
+        wire_limits = {
+            "max_input_bytes": 1024,
+            "max_object_bytes": 1024,
+            "max_header_bytes": 512,
+            "max_total_fields": 64,
+            "max_total_wire_bytes": 2048,
+            "max_work_units": 16384,
+        }
+        wire_limits.update(wire or {})
+        budget.wire_budget = CompactWireCursorTests().budget(**wire_limits)
+        cursor = bounded_parquet._CompactWireCursor(
+            payload,
+            start,
+            len(payload) if stop is None else stop,
+            budget.wire_budget,
+            kind="page_header",
+        )
+        return cursor, budget
+
+    def parse(
+        self, payload: bytes, *, remaining: int | None = None, **changes
+    ) -> tuple[
+        bounded_parquet._PageHeaderAdmission,
+        bounded_parquet._CompactWireCursor,
+        bounded_parquet._PageBudget,
+    ]:
+        cursor, budget = self.context(payload, **changes)
+        api = self.api()
+        result = api._admit_page_header(
+            cursor,
+            chunk_remaining_bytes=len(payload) + 7 if remaining is None else remaining,
+            budget=budget,
+        )
+        self.assertIsInstance(result, api._PageHeaderAdmission)
+        return result, cursor, budget
+
+    def refused(
+        self, payload: bytes, reason: str, *, remaining: int | None = None
+    ) -> tuple[bounded_parquet._CompactWireCursor, bounded_parquet._PageBudget]:
+        cursor, budget = self.context(payload)
+        with self.assertRaises(
+            (PinnedReadRefused, bounded_parquet._CompactWireMalformed)
+        ) as raised:
+            self.api()._admit_page_header(
+                cursor,
+                chunk_remaining_bytes=len(payload) + 32 if remaining is None else remaining,
+                budget=budget,
+            )
+        self.assertEqual(raised.exception.reason_code, reason)
+        self.assertEqual(budget.pages, 1)
+        self.assertEqual(tuple(getattr(budget, axis) for axis in self.body_axes), (0,) * 5)
+        return cursor, budget
+
+    def test_page_header_private_interface_is_explicit(self) -> None:
+        self.api()
+
+    def test_all_variants_preserve_fields_and_atomic_body_charge_without_decode(self) -> None:
+        api = self.api()
+        cases = (
+            (
+                0,
+                api._PageDataV1Header,
+                {
+                    "num_values": 3,
+                    "encoding": 8,
+                    "definition_level_encoding": 3,
+                    "repetition_level_encoding": 4,
+                    "statistics": None,
+                },
+                (7, 11, 3, 0, 0),
+            ),
+            (1, api._PageIndexHeader, {}, (7, 11, 0, 0, 0)),
+            (
+                2,
+                api._PageDictionaryHeader,
+                {"num_values": 2, "encoding": 2, "is_sorted": None},
+                (7, 11, 0, 2, 11),
+            ),
+            (
+                3,
+                api._PageDataV2Header,
+                {
+                    "num_values": 3,
+                    "num_nulls": 1,
+                    "num_rows": 2,
+                    "encoding": 9,
+                    "definition_levels_byte_length": 2,
+                    "repetition_levels_byte_length": 3,
+                    "is_compressed": None,
+                    "effective_is_compressed": True,
+                    "statistics": None,
+                },
+                (7, 11, 3, 0, 0),
+            ),
+        )
+        for kind, record, expected, charge in cases:
+            with self.subTest(kind=kind):
+                payload = self.wire(kind)
+                cursor, budget = self.context(payload)
+                reserve = budget.reserve
+                body_charges = []
+
+                def observe(value, *, budget=budget, body_charges=body_charges, reserve=reserve):
+                    if any(getattr(value, axis) for axis in self.body_axes):
+                        body_charges.append(value)
+                    counters = (
+                        budget.read_budget.source_opens,
+                        budget.read_budget.total_read_bytes,
+                        budget.wire_budget.total_wire_bytes,
+                        budget.wire_budget.work_units,
+                        budget.wire_budget.total_fields,
+                        budget.wire_budget.total_items,
+                        budget.wire_budget.total_string_bytes,
+                        budget.wire_budget.copied_payload_bytes,
+                    )
+                    result = reserve(value)
+                    self.assertEqual(
+                        (
+                            budget.read_budget.source_opens,
+                            budget.read_budget.total_read_bytes,
+                            budget.wire_budget.total_wire_bytes,
+                            budget.wire_budget.work_units,
+                            budget.wire_budget.total_fields,
+                            budget.wire_budget.total_items,
+                            budget.wire_budget.total_string_bytes,
+                            budget.wire_budget.copied_payload_bytes,
+                        ),
+                        counters,
+                    )
+                    return result
+
+                with patch.object(budget, "reserve", observe):
+                    result = api._admit_page_header(
+                        cursor, chunk_remaining_bytes=len(payload) + 7, budget=budget
+                    )
+                self.assertIsInstance(result, api._PageHeaderAdmission)
+                self.assertIs(type(result), api._PageHeaderAdmission)
+                self.assertIs(type(result.detail), record)
+                self.assertEqual(
+                    (result.header_start, result.header_end, result.body_start, result.body_end),
+                    (0, len(payload), len(payload), len(payload) + 7),
+                )
+                self.assertEqual(
+                    (result.page_type, result.compressed_page_size, result.uncompressed_page_size),
+                    (kind, 7, 11),
+                )
+                self.assertIsNone(result.crc)
+                self.assertIsNone(result.payload)
+                self.assertIs(result.decode_eligible, False)
+                self.assertEqual(cursor.position, len(payload))
+                self.assertEqual(len(body_charges), 1)
+                self.assertEqual(
+                    tuple(getattr(body_charges[0], axis) for axis in self.body_axes), charge
+                )
+                self.assertEqual(tuple(getattr(budget, axis) for axis in self.body_axes), charge)
+                self.assertEqual(budget.pages, 1)
+                self.assertEqual(
+                    (
+                        budget.levels,
+                        budget.codec_scratch_bytes,
+                        budget.output_rows,
+                        budget.output_bytes,
+                        budget.allocation_bytes,
+                    ),
+                    (0,) * 5,
+                )
+                self.assertEqual(
+                    (budget.read_budget.source_opens, budget.read_budget.total_read_bytes), (0, 0)
+                )
+                self.assertEqual(budget.wire_budget.copied_payload_bytes, 0)
+                self.assertEqual(budget.wire_budget.total_wire_bytes, len(payload))
+                for name, value in expected.items():
+                    self.assertEqual(getattr(result.detail, name), value)
+                with self.assertRaises(FrozenInstanceError):
+                    result.page_type = 99
+                if kind != 1:
+                    with self.assertRaises(FrozenInstanceError):
+                        result.detail.num_values = 99
+                if kind == 0:
+                    self.assertFalse(hasattr(result.detail, "num_rows"))
+
+    def test_signed_crc_and_optional_flags_preserve_presence(self) -> None:
+        for crc in (None, -(1 << 31), -1, 0, (1 << 31) - 1):
+            result, _, _ = self.parse(self.wire(1, crc=crc))
+            self.assertEqual(result.crc, crc)
+        for flag in (None, False, True):
+            for kind, field, name in ((2, 3, "is_sorted"), (3, 7, "is_compressed")):
+                with self.subTest(kind=kind, flag=flag):
+                    detail = self.detail_fields(kind)
+                    if flag is not None:
+                        detail += ((field, "bool", b"\x01" if flag else b"\x02"),)
+                    result, _, _ = self.parse(self.wire(kind, detail=detail, uncompressed=7))
+                    self.assertIs(getattr(result.detail, name), flag)
+                    if kind == 3:
+                        assert isinstance(result.detail, bounded_parquet._PageDataV2Header)
+                        self.assertIs(result.detail.effective_is_compressed, flag is not False)
+
+    def test_statistics_are_frozen_zero_copy_spans_with_absent_counts_distinct_from_zero(
+        self,
+    ) -> None:
+        statistics = (
+            (1, "binary", b"\x01\xaa"),
+            (2, "binary", b"\x01\xbb"),
+            (3, "i64", _grammar_integer(0)),
+            (4, "i64", _grammar_integer(2)),
+            (5, "binary", b"\x01\xcc"),
+            (6, "binary", b"\x01\xdd"),
+            (7, "bool", b"\x02"),
+            (8, "bool", b"\x01"),
+        )
+        for kind, field in ((0, 5), (3, 8)):
+            with self.subTest(kind=kind):
+                detail = self.detail_fields(kind) + (
+                    (field, "struct", _grammar_structure(statistics)),
+                )
+                payload = self.wire(kind, detail=detail)
+                with patch.object(
+                    bounded_parquet._CompactWireCursor,
+                    "read_binary",
+                    side_effect=AssertionError("statistics must remain spans"),
+                ):
+                    result, _, budget = self.parse(payload)
+                self.assertIs(result.payload, payload)
+                assert isinstance(
+                    result.detail,
+                    (
+                        bounded_parquet._PageDataV1Header,
+                        bounded_parquet._PageDataV2Header,
+                    ),
+                )
+                stats = result.detail.statistics
+                assert stats is not None
+                self.assertIs(type(stats), self.api()._PageStatistics)
+                for name, marker in (
+                    ("max", b"\xaa"),
+                    ("min", b"\xbb"),
+                    ("max_value", b"\xcc"),
+                    ("min_value", b"\xdd"),
+                ):
+                    span = getattr(stats, name)
+                    self.assertEqual(span, (payload.index(marker), payload.index(marker) + 1))
+                self.assertEqual((stats.null_count, stats.distinct_count), (0, 2))
+                self.assertIs(stats.is_max_value_exact, False)
+                self.assertIs(stats.is_min_value_exact, True)
+                self.assertEqual(budget.wire_budget.total_string_bytes, 4)
+                self.assertEqual(budget.wire_budget.copied_payload_bytes, 0)
+                frozen_field = "null_count"
+                with self.assertRaises(FrozenInstanceError):
+                    setattr(stats, frozen_field, 1)
+                empty = self.detail_fields(kind) + ((field, "struct", b"\x00"),)
+                result, _, _ = self.parse(self.wire(kind, detail=empty))
+                assert isinstance(
+                    result.detail,
+                    (
+                        bounded_parquet._PageDataV1Header,
+                        bounded_parquet._PageDataV2Header,
+                    ),
+                )
+                assert result.detail.statistics is not None
+                for name in (
+                    "max",
+                    "min",
+                    "max_value",
+                    "min_value",
+                    "null_count",
+                    "distinct_count",
+                    "is_max_value_exact",
+                    "is_min_value_exact",
+                ):
+                    self.assertIsNone(getattr(result.detail.statistics, name))
+                self.assertIsNone(result.payload)
+                zero_span = self.detail_fields(kind) + (
+                    (field, "struct", _grammar_structure(((1, "binary", b"\x00"),))),
+                )
+                payload = self.wire(kind, detail=zero_span)
+                result, _, budget = self.parse(payload)
+                self.assertIs(result.payload, payload)
+                assert isinstance(
+                    result.detail,
+                    (
+                        bounded_parquet._PageDataV1Header,
+                        bounded_parquet._PageDataV2Header,
+                    ),
+                )
+                assert result.detail.statistics is not None
+                assert result.detail.statistics.max is not None
+                self.assertEqual(result.detail.statistics.max[0], result.detail.statistics.max[1])
+                self.assertEqual(budget.wire_budget.total_string_bytes, 0)
+
+    def test_required_root_and_detail_fields_cannot_be_omitted(self) -> None:
+        for kind in range(4):
+            root = self.root_fields(kind)
+            for index in range(3):
+                with self.subTest(kind=kind, root=index):
+                    self.refused(
+                        _grammar_structure(root[:index] + root[index + 1 :]), "schema_mismatch"
+                    )
+            detail = self.detail_fields(kind)
+            for index in range(len(detail)):
+                with self.subTest(kind=kind, detail=index):
+                    self.refused(
+                        self.wire(kind, detail=detail[:index] + detail[index + 1 :]),
+                        "schema_mismatch",
+                    )
+
+    def test_reordered_root_and_nested_fields_are_admitted(self) -> None:
+        for kind in range(4):
+            with self.subTest(kind=kind):
+                root = self.root_fields(
+                    kind, detail=tuple(reversed(self.detail_fields(kind))), crc=-1
+                )
+                payload = _grammar_structure(tuple(reversed(root)))
+                result, cursor, _ = self.parse(payload)
+                self.assertEqual((result.page_type, result.crc), (kind, -1))
+                self.assertEqual(cursor.position, len(payload))
+
+    def test_union_and_field_schema_contradictions_refuse(self) -> None:
+        root = self.root_fields(0)
+        bad_roots = (
+            root[:-1],
+            root + ((6, "struct", b"\x00"),),
+            root[:-1] + ((6, "struct", b"\x00"),),
+            root + (root[0],),
+            root + ((9, "i32", b"\x00"),),
+            ((1, "i64", b"\x00"),) + root[1:],
+        )
+        for fields in bad_roots:
+            self.refused(_grammar_structure(fields), "schema_mismatch")
+        for kind in range(4):
+            fields = self.detail_fields(kind)
+            self.refused(self.wire(kind, detail=fields + ((9, "i32", b"\x00"),)), "schema_mismatch")
+            if fields:
+                self.refused(self.wire(kind, detail=fields + (fields[0],)), "schema_mismatch")
+                self.refused(
+                    self.wire(kind, detail=((1, "i64", b"\x00"),) + fields[1:]), "schema_mismatch"
+                )
+        for statistics in (
+            ((9, "i64", b"\x00"),),
+            ((3, "i32", b"\x00"),),
+            ((3, "i64", b"\x00"), (3, "i64", b"\x00")),
+        ):
+            fields = self.detail_fields(0) + ((5, "struct", _grammar_structure(statistics)),)
+            self.refused(self.wire(0, detail=fields), "schema_mismatch")
+
+    def test_every_header_prefix_truncates_without_body_charge(self) -> None:
+        for kind in range(4):
+            payload = self.wire(kind)
+            for stop in range(len(payload)):
+                with self.subTest(kind=kind, stop=stop):
+                    self.refused(payload[:stop], "truncated_wire")
+        self.refused(b"\x15\x80", "truncated_wire")
+
+    def test_known_encodings_are_preserved_in_every_encoding_slot(self) -> None:
+        for kind, field, name in (
+            (0, 2, "encoding"),
+            (0, 3, "definition_level_encoding"),
+            (0, 4, "repetition_level_encoding"),
+            (2, 2, "encoding"),
+            (3, 4, "encoding"),
+        ):
+            for encoding in (0, 2, 3, 4, 5, 6, 7, 8, 9):
+                with self.subTest(kind=kind, field=field, encoding=encoding):
+                    detail = tuple(
+                        (number, wire, _grammar_integer(encoding) if number == field else body)
+                        for number, wire, body in self.detail_fields(kind)
+                    )
+                    result, _, _ = self.parse(self.wire(kind, detail=detail))
+                    self.assertEqual(getattr(result.detail, name), encoding)
+                    self.assertIs(result.decode_eligible, False)
+
+    def test_unknown_page_and_encoding_enums_are_unsupported(self) -> None:
+        for kind in (-1, 4, (1 << 31) - 1):
+            root = self.root_fields(1)
+            self.refused(
+                _grammar_structure(((1, "i32", _grammar_integer(kind)),) + root[1:]),
+                "unsupported_mode",
+            )
+        for kind, field in ((0, 2), (0, 3), (0, 4), (2, 2), (3, 4)):
+            for encoding in (-1, 1, 10):
+                detail = tuple(
+                    (number, wire, _grammar_integer(encoding) if number == field else body)
+                    for number, wire, body in self.detail_fields(kind)
+                )
+                self.refused(self.wire(kind, detail=detail), "unsupported_mode")
+
+    def test_negative_sizes_counts_and_level_lengths_are_schema_refusals(self) -> None:
+        for name in ("compressed", "uncompressed"):
+            self.refused(self.wire(1, **{name: -1}), "schema_mismatch")
+        for kind, fields in ((0, (1,)), (2, (1,)), (3, (1, 2, 3, 5, 6))):
+            for field in fields:
+                detail = tuple(
+                    (number, wire, _grammar_integer(-1) if number == field else body)
+                    for number, wire, body in self.detail_fields(kind)
+                )
+                self.refused(self.wire(kind, detail=detail), "schema_mismatch")
+        for field in (3, 4):
+            stats = _grammar_structure(((field, "i64", _grammar_integer(-1)),))
+            self.refused(
+                self.wire(0, detail=self.detail_fields(0) + ((5, "struct", stats),)),
+                "schema_mismatch",
+            )
+
+    def test_zero_and_maximum_i32_declarations_do_not_materialize_counts(self) -> None:
+        for value in (0, (1 << 31) - 1):
+            for kind in range(4):
+                detail = self.detail_fields(kind)
+                count_fields = {0: (1,), 1: (), 2: (1,), 3: (1, 2, 3)}[kind]
+                detail = tuple(
+                    (
+                        number,
+                        wire,
+                        _grammar_integer(value)
+                        if number in count_fields
+                        else b"\x00"
+                        if kind == 3 and number in (5, 6)
+                        else body,
+                    )
+                    for number, wire, body in detail
+                )
+                payload = self.wire(kind, detail=detail, compressed=value, uncompressed=value)
+                result, _, budget = self.parse(payload, remaining=len(payload) + value)
+                self.assertEqual(
+                    (budget.compressed_bytes, budget.uncompressed_bytes), (value, value)
+                )
+                self.assertEqual(budget.values, value if kind in (0, 3) else 0)
+                self.assertEqual(budget.dictionary_entries, value if kind == 2 else 0)
+                self.assertEqual(
+                    (budget.output_rows, budget.output_bytes, budget.allocation_bytes), (0, 0, 0)
+                )
+                self.assertIs(result.decode_eligible, False)
+
+    def test_v2_count_level_subtraction_and_uncompressed_size_relations(self) -> None:
+        cases = (
+            (7, 11, {2: 4}),
+            (7, 11, {3: 4}),
+            (7, 11, {5: 8, 6: 0}),
+            (7, 11, {5: 0, 6: 8}),
+            (11, 7, {5: 8, 6: 0}),
+            (11, 7, {5: 0, 6: 8}),
+            (7, 11, {5: 4, 6: 4}),
+            (11, 7, {5: 4, 6: 4}),
+        )
+        for compressed, uncompressed, changed in cases:
+            detail = tuple(
+                (number, wire, _grammar_integer(changed[number]) if number in changed else body)
+                for number, wire, body in self.detail_fields(3)
+            )
+            self.refused(
+                self.wire(3, detail=detail, compressed=compressed, uncompressed=uncompressed),
+                "schema_mismatch",
+            )
+        detail = self.detail_fields(3) + ((7, "bool", b"\x02"),)
+        self.refused(self.wire(3, detail=detail), "schema_mismatch")
+        result, _, _ = self.parse(
+            self.wire(3, detail=detail, compressed=5, uncompressed=5), remaining=128
+        )
+        assert isinstance(result.detail, bounded_parquet._PageDataV2Header)
+        self.assertIs(result.detail.effective_is_compressed, False)
+
+    def test_nonzero_start_header_window_and_chunk_extent_are_distinct(self) -> None:
+        header = self.wire(0)
+        payload = b"\xff\xff" + header + b"\xff\xfe"
+        result, cursor, _ = self.parse(payload, start=2, remaining=len(header) + 7)
+        self.assertEqual(
+            (result.header_start, result.header_end, result.body_end),
+            (2, 2 + len(header), 2 + len(header) + 7),
+        )
+        self.assertEqual(cursor.position, 2 + len(header))
+        self.assertGreater(result.body_end, cursor.stop)
+        result, _, _ = self.parse(header, remaining=len(header) + 7)
+        self.assertEqual(result.body_end, len(header) + 7)
+        self.refused(header, "truncated_wire", remaining=len(header) + 6)
+
+    def test_caller_types_extent_freshness_and_shared_budget_precede_clock_or_consumption(
+        self,
+    ) -> None:
+        class IntegerSubclass(int):
+            pass
+
+        class CursorSubclass(bounded_parquet._CompactWireCursor):
+            pass
+
+        class BudgetSubclass(bounded_parquet._PageBudget):
+            pass
+
+        payload = self.wire(1)
+        for invalid in (True, -1, 0.0, IntegerSubclass(100), None, len(payload) - 1):
+            cursor, budget = self.context(payload)
+            before = PageBudgetTests().state(budget)
+            with (
+                patch.object(
+                    budget.read_budget,
+                    "clock_ns",
+                    side_effect=AssertionError("invalid caller reached clock"),
+                ),
+                self.assertRaises(PinnedReadRefused) as raised,
+            ):
+                self.api()._admit_page_header(cursor, chunk_remaining_bytes=invalid, budget=budget)
+            self.assertEqual(raised.exception.reason_code, "invalid_contract")
+            self.assertEqual(cursor.position, 0)
+            self.assertEqual(PageBudgetTests().state(budget), before)
+        for invalid in (
+            "cursor",
+            "cursor_subclass",
+            "budget",
+            "budget_subclass",
+            "kind",
+            "advanced",
+            "struct",
+            "bool",
+            "shared",
+        ):
+            cursor, budget = self.context(payload)
+            supplied_cursor, supplied_budget = cursor, budget
+            if invalid == "cursor":
+                supplied_cursor = SimpleNamespace()
+            if invalid == "cursor_subclass":
+                supplied_cursor = CursorSubclass(
+                    payload, 0, len(payload), budget.wire_budget, kind="page_header"
+                )
+            if invalid == "budget":
+                supplied_budget = SimpleNamespace()
+            if invalid == "budget_subclass":
+                supplied_budget = BudgetSubclass(
+                    read_budget=budget.read_budget,
+                    wire_budget=budget.wire_budget,
+                    limits=budget.limits,
+                )
+            if invalid == "kind":
+                cursor.kind = "footer"
+            if invalid == "advanced":
+                cursor.position = 1
+            if invalid == "struct":
+                cursor.begin_struct()
+            if invalid == "bool":
+                cursor._pending_bool = False
+            if invalid == "shared":
+                cursor.budget = CompactWireCursorTests().budget()
+            position = cursor.position
+            counters = (
+                PageBudgetTests().state(budget),
+                budget.wire_budget.total_wire_bytes,
+                budget.wire_budget.work_units,
+                budget.wire_budget.total_fields,
+            )
+            with (
+                patch.object(
+                    budget.read_budget,
+                    "clock_ns",
+                    side_effect=AssertionError("invalid caller reached clock"),
+                ),
+                self.assertRaises(PinnedReadRefused) as raised,
+            ):
+                self.api()._admit_page_header(
+                    supplied_cursor, chunk_remaining_bytes=100, budget=supplied_budget
+                )
+            self.assertEqual(raised.exception.reason_code, "invalid_contract")
+            self.assertEqual(cursor.position, position)
+            self.assertEqual(
+                (
+                    PageBudgetTests().state(budget),
+                    budget.wire_budget.total_wire_bytes,
+                    budget.wire_budget.work_units,
+                    budget.wire_budget.total_fields,
+                ),
+                counters,
+            )
+
+    def test_attempt_charge_survives_malformed_header_and_repeated_cursor_is_invalid(self) -> None:
+        payload = _grammar_structure(self.root_fields(1) + ((9, "i32", b"\x00"),))
+        cursor, budget = self.refused(payload, "schema_mismatch")
+        self.assertGreater(cursor.position, 0)
+        before = (
+            cursor.position,
+            PageBudgetTests().state(budget),
+            budget.wire_budget.total_wire_bytes,
+        )
+        with (
+            patch.object(
+                budget.read_budget,
+                "clock_ns",
+                side_effect=AssertionError("advanced cursor retried"),
+            ),
+            self.assertRaises(PinnedReadRefused) as raised,
+        ):
+            self.api()._admit_page_header(cursor, chunk_remaining_bytes=100, budget=budget)
+        self.assertEqual(raised.exception.reason_code, "invalid_contract")
+        self.assertEqual(
+            (cursor.position, PageBudgetTests().state(budget), budget.wire_budget.total_wire_bytes),
+            before,
+        )
+        next_payload = self.wire(1)
+        fresh = bounded_parquet._CompactWireCursor(
+            next_payload, 0, len(next_payload), budget.wire_budget, kind="page_header"
+        )
+        api = self.api()
+        result = api._admit_page_header(fresh, chunk_remaining_bytes=100, budget=budget)
+        self.assertIsInstance(result, api._PageHeaderAdmission)
+        self.assertEqual((budget.pages, budget.compressed_bytes), (2, 7))
+
+    def test_final_body_charge_refuses_atomically_on_each_late_axis(self) -> None:
+        for kind, axis, declared in (
+            (0, "compressed_bytes", 7),
+            (0, "uncompressed_bytes", 11),
+            (0, "values", 3),
+            (2, "dictionary_entries", 2),
+            (2, "dictionary_payload_bytes", 11),
+        ):
+            payload = self.wire(kind)
+            cursor, budget = self.context(payload, page={"max_" + axis: declared})
+            budget.reserve(bounded_parquet._PageCharge(**dict.fromkeys(self.body_axes, 1)))
+            with self.assertRaises(PinnedReadRefused) as raised:
+                self.api()._admit_page_header(cursor, chunk_remaining_bytes=100, budget=budget)
+            self.assertEqual(raised.exception.reason_code, "resource_limit")
+            self.assertEqual(tuple(getattr(budget, name) for name in self.body_axes), (1,) * 5)
+            self.assertEqual(cursor.position, len(payload))
+            self.assertEqual(budget.pages, 1)
+            self.assertGreater(budget.work_units, 0)
+
+    def test_exact_cumulative_body_and_page_limits_do_not_reset_between_headers(self) -> None:
+        payload = self.wire(0)
+        cursor, budget = self.context(
+            payload,
+            page={
+                "max_pages": 2,
+                "max_compressed_bytes": 14,
+                "max_uncompressed_bytes": 22,
+                "max_values": 6,
+            },
+        )
+        api = self.api()
+        for _ in range(2):
+            cursor = bounded_parquet._CompactWireCursor(
+                payload, 0, len(payload), budget.wire_budget, kind="page_header"
+            )
+            result = api._admit_page_header(cursor, chunk_remaining_bytes=100, budget=budget)
+            self.assertIsInstance(result, api._PageHeaderAdmission)
+        self.assertEqual(
+            (budget.pages, budget.compressed_bytes, budget.uncompressed_bytes, budget.values),
+            (2, 14, 22, 6),
+        )
+        cursor = bounded_parquet._CompactWireCursor(
+            payload, 0, len(payload), budget.wire_budget, kind="page_header"
+        )
+        before = (PageBudgetTests().state(budget), budget.wire_budget.total_wire_bytes)
+        with self.assertRaises(PinnedReadRefused) as raised:
+            self.api()._admit_page_header(cursor, chunk_remaining_bytes=100, budget=budget)
+        self.assertEqual(raised.exception.reason_code, "resource_limit")
+        self.assertEqual(cursor.position, 0)
+        self.assertEqual(
+            (PageBudgetTests().state(budget), budget.wire_budget.total_wire_bytes), before
+        )
+
+    def test_entry_deadline_refuses_before_attempt_or_wire_mutation(self) -> None:
+        cursor, budget = self.context(self.wire(0))
+        with (
+            patch.object(budget.read_budget, "clock_ns", return_value=10),
+            self.assertRaises(PinnedReadRefused) as raised,
+        ):
+            self.api()._admit_page_header(cursor, chunk_remaining_bytes=100, budget=budget)
+        self.assertEqual(raised.exception.reason_code, "deadline_exceeded")
+        self.assertEqual(PageBudgetTests().state(budget), (0,) * len(PageBudgetTests.axes))
+        self.assertEqual(
+            (cursor.position, budget.wire_budget.total_wire_bytes, budget.wire_budget.work_units),
+            (0, 0, 0),
+        )
+
+    def test_deadline_after_field_dispatch_prevents_scalar_consumption(self) -> None:
+        cursor, budget = self.context(self.wire(0))
+        now = [0]
+        read_field = cursor.read_field
+
+        def expire_after_field(allowed):
+            value = read_field(allowed)
+            now[0] = 10
+            return value
+
+        with (
+            patch.object(budget.read_budget, "clock_ns", side_effect=lambda: now[0]),
+            patch.object(cursor, "read_field", expire_after_field),
+            self.assertRaises(PinnedReadRefused) as raised,
+        ):
+            self.api()._admit_page_header(cursor, chunk_remaining_bytes=100, budget=budget)
+        self.assertEqual(raised.exception.reason_code, "deadline_exceeded")
+        self.assertEqual(
+            (cursor.position, budget.wire_budget.total_wire_bytes, budget.pages), (1, 1, 1)
+        )
+        self.assertEqual(tuple(getattr(budget, axis) for axis in self.body_axes), (0,) * 5)
+
+    def test_logical_work_reservation_precedes_struct_fields_scalars_and_retained_records(
+        self,
+    ) -> None:
+        api = self.api()
+        stats = _grammar_structure(
+            ((1, "binary", b"\x01\xaa"), (3, "i64", b"\x00"), (7, "bool", b"\x02"))
+        )
+        detail = self.detail_fields(3) + ((8, "struct", stats),)
+        cursor, budget = self.context(self.wire(3, detail=detail))
+        seen = []
+        previous = [0]
+
+        def observe(name, operation):
+            def call(*args, **kwargs):
+                self.assertGreater(budget.work_units, previous[0], name)
+                previous[0] = budget.work_units
+                seen.append(name)
+                return operation(*args, **kwargs)
+
+            return call
+
+        with ExitStack() as stack:
+            for name in (
+                "begin_struct",
+                "read_field",
+                "read_i32",
+                "read_i64",
+                "read_bool",
+                "read_binary_span",
+            ):
+                stack.enter_context(
+                    patch.object(cursor, name, observe(name, getattr(cursor, name)))
+                )
+            for name in ("_PageStatistics", "_PageDataV2Header", "_PageHeaderAdmission"):
+                stack.enter_context(
+                    patch.object(bounded_parquet, name, observe(name, getattr(api, name)))
+                )
+            result = api._admit_page_header(cursor, chunk_remaining_bytes=200, budget=budget)
+        self.assertIsInstance(result, api._PageHeaderAdmission)
+        self.assertIs(result.decode_eligible, False)
+        for name in (
+            "begin_struct",
+            "read_field",
+            "read_i32",
+            "read_i64",
+            "read_bool",
+            "read_binary_span",
+            "_PageStatistics",
+            "_PageDataV2Header",
+            "_PageHeaderAdmission",
+        ):
+            self.assertIn(name, seen)
+
+    def test_deadline_after_root_completion_prevents_final_body_charge(self) -> None:
+        payload = self.wire(0)
+        cursor, budget = self.context(payload)
+        now = [0]
+        finish = cursor.finish
+
+        def expire_after_finish(*, require_exhausted):
+            finish(require_exhausted=require_exhausted)
+            now[0] = 10
+
+        with (
+            patch.object(budget.read_budget, "clock_ns", side_effect=lambda: now[0]),
+            patch.object(cursor, "finish", expire_after_finish),
+            self.assertRaises(PinnedReadRefused) as raised,
+        ):
+            self.api()._admit_page_header(cursor, chunk_remaining_bytes=100, budget=budget)
+        self.assertEqual(raised.exception.reason_code, "deadline_exceeded")
+        self.assertEqual((cursor.position, budget.pages), (len(payload), 1))
+        self.assertEqual(tuple(getattr(budget, axis) for axis in self.body_axes), (0,) * 5)
+
+    def test_work_exhaustion_precedes_first_field_byte(self) -> None:
+        cursor, budget = self.context(self.wire(1), page={"max_work_units": 1})
+        with self.assertRaises(PinnedReadRefused) as raised:
+            self.api()._admit_page_header(cursor, chunk_remaining_bytes=100, budget=budget)
+        self.assertEqual(raised.exception.reason_code, "resource_limit")
+        self.assertEqual(
+            (budget.pages, budget.work_units, cursor.position, budget.wire_budget.total_wire_bytes),
+            (1, 1, 0, 0),
+        )
+
+    def test_wire_and_header_byte_limits_precede_advance(self) -> None:
+        payload = self.wire(0)
+        result, cursor, _ = self.parse(
+            payload + b"\xff", remaining=len(payload) + 7, wire={"max_header_bytes": len(payload)}
+        )
+        self.assertEqual((result.header_end, cursor.position), (len(payload), len(payload)))
+        for limits, position in (
+            ({"max_total_wire_bytes": 1}, 1),
+            ({"max_header_bytes": len(payload) - 1}, len(payload) - 1),
+        ):
+            cursor, budget = self.context(payload, wire=limits)
+            with self.assertRaises(PinnedReadRefused) as raised:
+                self.api()._admit_page_header(cursor, chunk_remaining_bytes=100, budget=budget)
+            self.assertEqual(raised.exception.reason_code, "resource_limit")
+            self.assertEqual(
+                (cursor.position, budget.wire_budget.total_wire_bytes), (position, position)
+            )
+            self.assertEqual(tuple(getattr(budget, axis) for axis in self.body_axes), (0,) * 5)
+
+    def test_statistics_byte_quota_refuses_before_span_body_or_copy(self) -> None:
+        stats = _grammar_structure(((1, "binary", b"\x03abc"),))
+        payload = self.wire(0, detail=self.detail_fields(0) + ((5, "struct", stats),))
+        cursor, budget = self.context(payload, wire={"max_string_bytes": 2})
+        with (
+            patch.object(
+                cursor, "read_binary", side_effect=AssertionError("binary copy forbidden")
+            ),
+            self.assertRaises(PinnedReadRefused) as raised,
+        ):
+            self.api()._admit_page_header(cursor, chunk_remaining_bytes=100, budget=budget)
+        self.assertEqual(raised.exception.reason_code, "resource_limit")
+        self.assertEqual(cursor.position, payload.index(b"abc"))
+        self.assertEqual(
+            (budget.wire_budget.total_string_bytes, budget.wire_budget.copied_payload_bytes), (0, 0)
+        )
+        self.assertEqual(tuple(getattr(budget, axis) for axis in self.body_axes), (0,) * 5)
+
+
 if __name__ == "__main__":
     unittest.main()
