@@ -5159,5 +5159,316 @@ class FooterEnvelopeTests(unittest.TestCase):
                     )
 
 
+class PageBudgetTests(unittest.TestCase):
+    axes = (
+        "pages",
+        "compressed_bytes",
+        "uncompressed_bytes",
+        "values",
+        "levels",
+        "dictionary_entries",
+        "dictionary_payload_bytes",
+        "codec_scratch_bytes",
+        "output_rows",
+        "output_bytes",
+        "allocation_bytes",
+        "work_units",
+    )
+
+    class IntegerSubclass(int):
+        pass
+
+    def api(self) -> SimpleNamespace:
+        names = ("_PageLimits", "_PageCharge", "_PageBudget")
+        found = {}
+        for name in names:
+            value = getattr(bounded_parquet, name, None)
+            self.assertTrue(callable(value), f"missing callable {name}")
+            found[name] = value
+        return SimpleNamespace(**found)
+
+    def budget(self, **changes: int) -> bounded_parquet._PageBudget:
+        api = self.api()
+        limits = dict.fromkeys(("max_" + axis for axis in self.axes), 10)
+        limits.update(changes)
+        read_budget = bounded_parquet._PinnedReadBudget(
+            PinnedReadLimits(
+                max_source_size_bytes=100,
+                max_total_read_bytes=100,
+                max_source_opens=10,
+                max_decoded_rows=100,
+                max_output_rows=100,
+                max_row_groups=10,
+                max_row_group_uncompressed_bytes=100,
+                max_total_uncompressed_bytes=100,
+                batch_rows=10,
+                deadline_ns=10,
+            ),
+            clock_ns=lambda: 0,
+        )
+        return api._PageBudget(
+            read_budget=read_budget,
+            wire_budget=CompactWireCursorTests().budget(),
+            limits=api._PageLimits(**limits),
+        )
+
+    def state(self, budget: bounded_parquet._PageBudget) -> tuple[int, ...]:
+        return tuple(getattr(budget, axis) for axis in self.axes)
+
+    def test_page_limits_require_exact_positive_integers_on_every_axis(self) -> None:
+        api = self.api()
+        for axis in self.axes:
+            for invalid in (True, False, 0, -1, 1.0, "1", None, self.IntegerSubclass(1)):
+                with self.subTest(axis=axis, invalid=invalid):
+                    limits: dict[str, int | float | str | None] = dict.fromkeys(
+                        ("max_" + name for name in self.axes), 1
+                    )
+                    limits["max_" + axis] = invalid
+                    with self.assertRaises(PinnedReadRefused) as raised:
+                        api._PageLimits(**limits)
+                    self.assertEqual(raised.exception.reason_code, "invalid_contract")
+
+    def test_page_charges_require_exact_nonnegative_integers_on_every_axis(self) -> None:
+        api = self.api()
+        for axis in self.axes:
+            for invalid in (True, False, -1, 0.0, "0", None, self.IntegerSubclass(0)):
+                with self.subTest(axis=axis, invalid=invalid):
+                    with self.assertRaises(PinnedReadRefused) as raised:
+                        api._PageCharge(**{axis: invalid})
+                    self.assertEqual(raised.exception.reason_code, "invalid_contract")
+
+    def test_page_declarations_are_frozen_on_every_axis(self) -> None:
+        api = self.api()
+        limits = api._PageLimits(**dict.fromkeys(("max_" + axis for axis in self.axes), 1))
+        charge = api._PageCharge()
+        for axis in self.axes:
+            for record, field in ((limits, "max_" + axis), (charge, axis)):
+                with (
+                    self.subTest(axis=axis, field=field),
+                    self.assertRaises(FrozenInstanceError),
+                ):
+                    setattr(record, field, 2)
+
+    def test_page_budget_retains_supplied_objects_and_starts_at_zero(self) -> None:
+        api = self.api()
+        supplied = self.budget()
+        budget = api._PageBudget(
+            read_budget=supplied.read_budget,
+            wire_budget=supplied.wire_budget,
+            limits=supplied.limits,
+        )
+        self.assertIs(budget.read_budget, supplied.read_budget)
+        self.assertIs(budget.wire_budget, supplied.wire_budget)
+        self.assertIs(budget.limits, supplied.limits)
+        self.assertEqual(self.state(budget), (0,) * 12)
+
+    def test_page_budget_requires_exact_budget_and_limit_types(self) -> None:
+        api = self.api()
+        budget = self.budget()
+
+        class ReadSubclass(bounded_parquet._PinnedReadBudget):
+            pass
+
+        class WireSubclass(bounded_parquet._CompactWireBudget):
+            pass
+
+        class LimitsSubclass(api._PageLimits):
+            pass
+
+        subclasses = {
+            "read_budget": ReadSubclass(budget.read_budget.limits, clock_ns=lambda: 0),
+            "wire_budget": WireSubclass(budget.wire_budget.limits),
+            "limits": LimitsSubclass(**dict.fromkeys(("max_" + axis for axis in self.axes), 10)),
+        }
+        supplied = {
+            "read_budget": budget.read_budget,
+            "wire_budget": budget.wire_budget,
+            "limits": budget.limits,
+        }
+        for name in supplied:
+            for invalid in (None, True, SimpleNamespace(), subclasses[name]):
+                with self.subTest(argument=name, invalid=type(invalid).__name__):
+                    with self.assertRaises(PinnedReadRefused) as raised:
+                        api._PageBudget(**(supplied | {name: invalid}))
+                    self.assertEqual(raised.exception.reason_code, "invalid_contract")
+
+    def test_page_budget_revalidates_supplied_limits(self) -> None:
+        api = self.api()
+        for axis in self.axes:
+            with self.subTest(axis=axis):
+                budget = self.budget()
+                object.__setattr__(budget.limits, "max_" + axis, True)
+                with self.assertRaises(PinnedReadRefused) as raised:
+                    api._PageBudget(
+                        read_budget=budget.read_budget,
+                        wire_budget=budget.wire_budget,
+                        limits=budget.limits,
+                    )
+                self.assertEqual(raised.exception.reason_code, "invalid_contract")
+
+    def test_page_reservation_requires_exact_charge_type_before_clock(self) -> None:
+        api = self.api()
+        budget = self.budget()
+        budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 1)))
+
+        class ChargeSubclass(api._PageCharge):
+            pass
+
+        for invalid in (None, True, 1, {}, SimpleNamespace(), ChargeSubclass()):
+            with self.subTest(invalid=type(invalid).__name__):
+                with (
+                    patch.object(budget.read_budget, "clock_ns") as clock,
+                    self.assertRaises(PinnedReadRefused) as raised,
+                ):
+                    budget.reserve(invalid)
+                self.assertEqual(raised.exception.reason_code, "invalid_contract")
+                clock.assert_not_called()
+                self.assertEqual(self.state(budget), (1,) * 12)
+
+    def test_page_reservation_revalidates_charge_before_clock_without_mutation(self) -> None:
+        api = self.api()
+        budget = self.budget()
+        budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 1)))
+        for axis in self.axes:
+            for invalid in (True, False, -1, 0.0, "0", None, self.IntegerSubclass(0)):
+                with self.subTest(axis=axis, invalid=invalid):
+                    charge = api._PageCharge(**dict.fromkeys(self.axes, 1))
+                    object.__setattr__(charge, axis, invalid)
+                    with (
+                        patch.object(budget.read_budget, "clock_ns") as clock,
+                        self.assertRaises(PinnedReadRefused) as raised,
+                    ):
+                        budget.reserve(charge)
+                    self.assertEqual(raised.exception.reason_code, "invalid_contract")
+                    clock.assert_not_called()
+                    self.assertEqual(self.state(budget), (1,) * 12)
+
+    def test_page_default_and_explicit_zero_charges_do_not_consume_capacity(self) -> None:
+        api = self.api()
+        for charge in (api._PageCharge(), api._PageCharge(**dict.fromkeys(self.axes, 0))):
+            with self.subTest(charge=charge):
+                budget = self.budget()
+                self.assertIsNone(budget.reserve(charge))
+                self.assertEqual(self.state(budget), (0,) * 12)
+
+    def test_page_exact_capacity_and_zero_after_exhaustion_are_valid(self) -> None:
+        api = self.api()
+        budget = self.budget(**dict.fromkeys(("max_" + axis for axis in self.axes), 1))
+        self.assertIsNone(budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 1))))
+        self.assertIsNone(budget.reserve(api._PageCharge()))
+        self.assertEqual(self.state(budget), (1,) * 12)
+
+    def test_page_axes_accumulate_independently_across_calls(self) -> None:
+        api = self.api()
+        for index, axis in enumerate(self.axes):
+            with self.subTest(axis=axis):
+                budget = self.budget()
+                budget.reserve(api._PageCharge(**{axis: 2}))
+                budget.reserve(api._PageCharge(**{axis: 3}))
+                self.assertEqual(self.state(budget), (0,) * index + (5,) + (0,) * (11 - index))
+
+    def test_page_any_axis_over_remaining_refuses_all_changes_atomically(self) -> None:
+        api = self.api()
+        for axis in self.axes:
+            with self.subTest(axis=axis):
+                budget = self.budget()
+                budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 2)))
+                increments = dict.fromkeys(self.axes, 1) | {axis: 9}
+                with self.assertRaises(PinnedReadRefused) as raised:
+                    budget.reserve(api._PageCharge(**increments))
+                self.assertEqual(raised.exception.reason_code, "resource_limit")
+                self.assertEqual(self.state(budget), (2,) * 12)
+
+    def test_page_exact_remaining_capacity_is_available_after_refusal(self) -> None:
+        api = self.api()
+        budget = self.budget()
+        budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 3)))
+        with self.assertRaises(PinnedReadRefused) as raised:
+            budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 8)))
+        self.assertEqual(raised.exception.reason_code, "resource_limit")
+        self.assertIsNone(budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 7))))
+        self.assertEqual(self.state(budget), (10,) * 12)
+
+    def test_page_shared_deadline_refuses_before_any_counter_mutation(self) -> None:
+        api = self.api()
+        for now in (10, 11):
+            for increment in (0, 1, 10):
+                with self.subTest(now=now, increment=increment):
+                    budget = self.budget()
+                    budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 1)))
+                    charge = api._PageCharge(**dict.fromkeys(self.axes, increment))
+                    with (
+                        patch.object(budget.read_budget, "clock_ns", return_value=now) as clock,
+                        self.assertRaises(PinnedReadRefused) as raised,
+                    ):
+                        budget.reserve(charge)
+                    self.assertEqual(raised.exception.reason_code, "deadline_exceeded")
+                    clock.assert_called()
+                    self.assertEqual(self.state(budget), (1,) * 12)
+
+    def test_page_live_shared_clock_allows_reservation_before_deadline(self) -> None:
+        api = self.api()
+        budget = self.budget()
+        with patch.object(budget.read_budget, "clock_ns", return_value=9) as clock:
+            self.assertIsNone(budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 1))))
+        clock.assert_called()
+        self.assertEqual(self.state(budget), (1,) * 12)
+
+    def test_page_shared_clock_contract_refusal_preserves_counters(self) -> None:
+        api = self.api()
+        for invalid in (True, -1, 0.0, "0", None):
+            with self.subTest(clock=invalid):
+                budget = self.budget()
+                budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 1)))
+                with (
+                    patch.object(budget.read_budget, "clock_ns", return_value=invalid),
+                    self.assertRaises(PinnedReadRefused) as raised,
+                ):
+                    budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 1)))
+                self.assertEqual(raised.exception.reason_code, "invalid_contract")
+                self.assertEqual(self.state(budget), (1,) * 12)
+
+    def test_page_accounting_preserves_preexisting_io_and_wire_counters(self) -> None:
+        api = self.api()
+        supplied = self.budget()
+        read = supplied.read_budget
+        wire = supplied.wire_budget
+        read.before_open()
+        read.record_read(3)
+        wire._reserve(
+            wire_bytes=2, work_units=3, field_count=4, items=5, string_bytes=6, copied_bytes=7
+        )
+        wire_axes = (
+            "total_wire_bytes",
+            "work_units",
+            "total_fields",
+            "total_items",
+            "total_string_bytes",
+            "copied_payload_bytes",
+        )
+        budget = api._PageBudget(read_budget=read, wire_budget=wire, limits=supplied.limits)
+        self.assertEqual((read.source_opens, read.total_read_bytes), (1, 3))
+        self.assertEqual(tuple(getattr(wire, axis) for axis in wire_axes), (2, 3, 4, 5, 6, 7))
+        budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 1)))
+        with self.assertRaises(PinnedReadRefused) as raised:
+            budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 10)))
+        self.assertEqual(raised.exception.reason_code, "resource_limit")
+        self.assertEqual((read.source_opens, read.total_read_bytes), (1, 3))
+        self.assertEqual(tuple(getattr(wire, axis) for axis in wire_axes), (2, 3, 4, 5, 6, 7))
+        self.assertEqual(self.state(budget), (1,) * 12)
+
+    def test_page_reserved_capacity_is_retained_after_caller_failure(self) -> None:
+        api = self.api()
+        budget = self.budget()
+        with self.assertRaises(RuntimeError):
+            budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 4)))
+            raise RuntimeError("neutral downstream failure")
+        self.assertEqual(self.state(budget), (4,) * 12)
+        with self.assertRaises(PinnedReadRefused) as raised:
+            budget.reserve(api._PageCharge(**dict.fromkeys(self.axes, 7)))
+        self.assertEqual(raised.exception.reason_code, "resource_limit")
+        self.assertEqual(self.state(budget), (4,) * 12)
+
+
 if __name__ == "__main__":
     unittest.main()

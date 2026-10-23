@@ -2492,3 +2492,99 @@ def _profile_footer_envelope(envelope: _FooterEnvelope, *, budget: _FooterBudget
     profile = _complete_footer_profile(document)
     envelope.read_budget.check_deadline()
     return profile
+
+
+@dataclass(frozen=True, slots=True)
+class _PageLimits:
+    max_pages: int
+    max_compressed_bytes: int
+    max_uncompressed_bytes: int
+    max_values: int
+    max_levels: int
+    max_dictionary_entries: int
+    max_dictionary_payload_bytes: int
+    max_codec_scratch_bytes: int
+    max_output_rows: int
+    max_output_bytes: int
+    max_allocation_bytes: int
+    max_work_units: int
+
+    def __post_init__(self) -> None:
+        for declaration in fields(self):
+            value = getattr(self, declaration.name)
+            if type(value) is not int or value <= 0:
+                raise PinnedReadRefused("invalid_contract")
+
+
+@dataclass(frozen=True, slots=True)
+class _PageCharge:
+    pages: int = 0
+    compressed_bytes: int = 0
+    uncompressed_bytes: int = 0
+    values: int = 0
+    levels: int = 0
+    dictionary_entries: int = 0
+    dictionary_payload_bytes: int = 0
+    codec_scratch_bytes: int = 0
+    output_rows: int = 0
+    output_bytes: int = 0
+    allocation_bytes: int = 0
+    work_units: int = 0
+
+    def __post_init__(self) -> None:
+        for declaration in fields(self):
+            value = getattr(self, declaration.name)
+            if type(value) is not int or value < 0:
+                raise PinnedReadRefused("invalid_contract")
+
+
+class _PageBudget:
+    """Mutable cumulative reservations sharing the invocation's I/O deadline."""
+
+    def __init__(
+        self,
+        *,
+        read_budget: _PinnedReadBudget,
+        wire_budget: _CompactWireBudget,
+        limits: _PageLimits,
+    ) -> None:
+        if (
+            type(read_budget) is not _PinnedReadBudget
+            or type(wire_budget) is not _CompactWireBudget
+            or type(limits) is not _PageLimits
+        ):
+            raise PinnedReadRefused("invalid_contract")
+        limits.__post_init__()
+        self.read_budget = read_budget
+        self.wire_budget = wire_budget
+        self.limits = limits
+        self.pages = 0
+        self.compressed_bytes = 0
+        self.uncompressed_bytes = 0
+        self.values = 0
+        self.levels = 0
+        self.dictionary_entries = 0
+        self.dictionary_payload_bytes = 0
+        self.codec_scratch_bytes = 0
+        self.output_rows = 0
+        self.output_bytes = 0
+        self.allocation_bytes = 0
+        self.work_units = 0
+
+    def reserve(self, charge: _PageCharge) -> None:
+        if type(charge) is not _PageCharge:
+            raise PinnedReadRefused("invalid_contract")
+        charge.__post_init__()
+        self.read_budget.check_deadline()
+        for declaration in fields(charge):
+            current = getattr(self, declaration.name)
+            increment = getattr(charge, declaration.name)
+            maximum = getattr(self.limits, "max_" + declaration.name)
+            if increment > maximum - current:
+                raise PinnedReadRefused("resource_limit")
+        for declaration in fields(charge):
+            setattr(
+                self,
+                declaration.name,
+                getattr(self, declaration.name) + getattr(charge, declaration.name),
+            )
