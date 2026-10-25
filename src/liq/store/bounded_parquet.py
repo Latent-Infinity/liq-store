@@ -3036,3 +3036,297 @@ def _admit_page_header(
         payload=payload,
         decode_eligible=False,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _PageLevelInput:
+    payload: bytes
+    start: int
+    stop: int
+    header: _PageDataV1Header | _PageDataV2Header
+    max_definition_level: int
+    max_repetition_level: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PageLevelSummary:
+    repetition_span: tuple[int, int]
+    definition_span: tuple[int, int]
+    values_span: tuple[int, int]
+    positions: int
+    non_nulls: int
+    row_starts: int
+    first_repetition_level: int | None
+
+
+_LEVEL_MAX_RUN = (1 << 31) - 1
+_LEVEL_MAX_VALUE = (1 << 64) - 1
+
+
+def _validate_level_input(section: _PageLevelInput, budget: _PageBudget) -> None:
+    if type(section) is not _PageLevelInput or type(budget) is not _PageBudget:
+        raise PinnedReadRefused("invalid_contract")
+    if type(section.payload) is not bytes or any(
+        type(value) is not int
+        for value in (
+            section.start,
+            section.stop,
+            section.max_definition_level,
+            section.max_repetition_level,
+        )
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    if (
+        section.start < 0
+        or section.stop < section.start
+        or section.stop > len(section.payload)
+        or section.max_definition_level < 0
+        or section.max_repetition_level < 0
+        or section.max_repetition_level > section.max_definition_level
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    header = section.header
+    if type(header) not in (_PageDataV1Header, _PageDataV2Header):
+        raise PinnedReadRefused("invalid_contract")
+    if (
+        type(header.num_values) is not int
+        or header.num_values < 0
+        or header.num_values > _LEVEL_MAX_RUN
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    if isinstance(header, _PageDataV1Header):
+        if (
+            type(header.definition_level_encoding) is not int
+            or type(header.repetition_level_encoding) is not int
+        ):
+            raise PinnedReadRefused("invalid_contract")
+        if (
+            section.max_definition_level > 0 and header.definition_level_encoding not in (3, 4)
+        ) or (section.max_repetition_level > 0 and header.repetition_level_encoding not in (3, 4)):
+            raise PinnedReadRefused("unsupported_mode")
+    else:
+        if any(
+            type(value) is not int or value < 0 or value > _LEVEL_MAX_RUN
+            for value in (
+                header.num_nulls,
+                header.num_rows,
+                header.definition_levels_byte_length,
+                header.repetition_levels_byte_length,
+            )
+        ):
+            raise PinnedReadRefused("invalid_contract")
+        if (
+            header.num_nulls > header.num_values
+            or header.num_rows > header.num_values
+            or (header.is_compressed is not None and type(header.is_compressed) is not bool)
+            or type(header.effective_is_compressed) is not bool
+            or header.effective_is_compressed is not (header.is_compressed is not False)
+        ):
+            raise PinnedReadRefused("invalid_contract")
+        if (section.max_definition_level == 0 and header.definition_levels_byte_length != 0) or (
+            section.max_repetition_level == 0 and header.repetition_levels_byte_length != 0
+        ):
+            raise PinnedReadRefused("unsupported_mode")
+    if section.max_definition_level > _LEVEL_MAX_VALUE:
+        raise PinnedReadRefused("unsupported_mode")
+
+
+class _PageLevelStream:
+    def __init__(self, section: _PageLevelInput, budget: _PageBudget, repetition: bool) -> None:
+        self.payload = section.payload
+        self.budget = budget
+        self.maximum = section.max_repetition_level if repetition else section.max_definition_level
+        self.width = self.maximum.bit_length()
+        self.positions = section.header.num_values
+        self.v2_length: int | None = None
+        if isinstance(section.header, _PageDataV1Header):
+            self.encoding = (
+                section.header.repetition_level_encoding
+                if repetition
+                else section.header.definition_level_encoding
+            )
+        else:
+            self.encoding = 3
+            self.v2_length = (
+                section.header.repetition_levels_byte_length
+                if repetition
+                else section.header.definition_levels_byte_length
+            )
+        self.start = section.start
+        self.end = section.start
+        self.stop = section.stop
+        self.position = section.start
+        self.remaining = 0
+        self.literal = False
+        self.value = 0
+        self.bit_base = section.start
+        self.bit_position = 0
+
+    def _admit_bytes(self, count: int) -> int:
+        if count > self.stop - self.position:
+            raise _CompactWireMalformed("truncated_wire")
+        if count:
+            self.budget.reserve(_PageCharge(work_units=count))
+        start = self.position
+        self.position += count
+        return start
+
+    def initialize(self, start: int) -> int:
+        self.start = self.position = start
+        if self.maximum == 0:
+            self.end = start
+            return start
+        _page_work(self.budget)
+        if self.v2_length is not None:
+            length = self.v2_length
+            if length > self.stop - start:
+                raise _CompactWireMalformed("truncated_wire")
+            self.end = self.stop = start + length
+        elif self.encoding == 3:
+            offset = self._admit_bytes(4)
+            length = 0
+            for index in range(4):
+                length |= self.payload[offset + index] << (index * 8)
+            if length > self.stop - self.position:
+                raise _CompactWireMalformed("truncated_wire")
+            self.end = self.stop = self.position + length
+        else:
+            groups, tail = divmod(self.positions, 8)
+            available = self.stop - start
+            if groups > available // self.width:
+                raise _CompactWireMalformed("truncated_wire")
+            length = groups * self.width
+            tail_bytes = (tail * self.width + 7) // 8
+            if tail_bytes > available - length:
+                raise _CompactWireMalformed("truncated_wire")
+            length += tail_bytes
+            self.bit_base = self._admit_bytes(length)
+            self.end = self.stop = self.position
+            self.remaining = self.positions
+        return self.end
+
+    def prepare(self, positions_left: int) -> None:
+        if self.maximum == 0 or self.encoding == 4 or self.remaining:
+            return
+        _page_work(self.budget)
+        header = 0
+        for index in range(5):
+            offset = self._admit_bytes(1)
+            byte = self.payload[offset]
+            if index == 4 and byte & 0xF0:
+                raise _CompactWireMalformed("schema_mismatch")
+            header |= (byte & 0x7F) << (7 * index)
+            if not byte & 0x80:
+                break
+        else:
+            raise _CompactWireMalformed("schema_mismatch")
+        count = header >> 1
+        if count == 0:
+            raise _CompactWireMalformed("schema_mismatch")
+        self.literal = bool(header & 1)
+        self.bit_position = 0
+        if self.literal:
+            if count > _LEVEL_MAX_RUN // 8:
+                raise _CompactWireMalformed("schema_mismatch")
+            if count > (self.stop - self.position) // self.width:
+                raise _CompactWireMalformed("truncated_wire")
+            self.bit_base = self._admit_bytes(count * self.width)
+            self.remaining = count * 8
+            if self.remaining > positions_left + 7:
+                raise PinnedReadRefused("unsupported_mode")
+        else:
+            offset = self._admit_bytes((self.width + 7) // 8)
+            self.value = 0
+            for index in range((self.width + 7) // 8):
+                self.value |= self.payload[offset + index] << (index * 8)
+            if self.value > self.maximum:
+                raise _CompactWireMalformed("schema_mismatch")
+            if count > positions_left:
+                raise PinnedReadRefused("unsupported_mode")
+            self.remaining = count
+
+    def take(self) -> int:
+        _page_work(self.budget)
+        if self.maximum == 0:
+            return 0
+        if self.encoding == 3 and not self.literal:
+            value = self.value
+        else:
+            value = 0
+            for index in range(self.width):
+                bit = self.bit_position + index
+                byte = self.payload[self.bit_base + bit // 8]
+                if self.encoding == 4:
+                    value = (value << 1) | ((byte >> (7 - bit % 8)) & 1)
+                else:
+                    value |= ((byte >> (bit % 8)) & 1) << index
+            self.bit_position += self.width
+        self.remaining -= 1
+        if value > self.maximum:
+            raise _CompactWireMalformed("schema_mismatch")
+        return value
+
+    def finish(self) -> None:
+        if self.maximum == 0:
+            return
+        if self.position != self.end:
+            raise PinnedReadRefused("unsupported_mode")
+        if self.encoding == 4:
+            padding = (-self.bit_position) % 8
+            if padding and self.payload[self.end - 1] & ((1 << padding) - 1):
+                raise _CompactWireMalformed("schema_mismatch")
+        elif self.remaining and not (self.literal and self.remaining <= 7):
+            raise PinnedReadRefused("unsupported_mode")
+
+
+def _scan_page_levels(section: _PageLevelInput, *, budget: _PageBudget) -> _PageLevelSummary:
+    _validate_level_input(section, budget)
+    count = section.header.num_values
+    budget.reserve(_PageCharge(levels=2 * count, work_units=1))
+    if section.max_definition_level == 0 and section.max_repetition_level == 0:
+        _page_work(budget)
+        non_nulls = rows = count
+        first = 0 if count else None
+        repetition_span = definition_span = (section.start, section.start)
+        values_start = section.start
+        _page_work(budget)
+    else:
+        repetition = _PageLevelStream(section, budget, True)
+        definition = _PageLevelStream(section, budget, False)
+        definition_start = repetition.initialize(section.start)
+        values_start = definition.initialize(definition_start)
+        non_nulls = rows = 0
+        first = None
+        for index in range(count):
+            repetition.prepare(count - index)
+            definition.prepare(count - index)
+            rep = repetition.take()
+            defined = definition.take()
+            _page_work(budget)
+            if first is None:
+                first = rep
+            if rep == 0:
+                rows += 1
+            if defined == section.max_definition_level:
+                non_nulls += 1
+        _page_work(budget)
+        repetition.finish()
+        definition.finish()
+        repetition_span = (repetition.start, repetition.end)
+        definition_span = (definition.start, definition.end)
+    header = section.header
+    if isinstance(header, _PageDataV2Header) and (
+        non_nulls != count - header.num_nulls
+        or rows != header.num_rows
+        or (count > 0 and first != 0)
+    ):
+        raise _CompactWireMalformed("schema_mismatch")
+    return _PageLevelSummary(
+        repetition_span=repetition_span,
+        definition_span=definition_span,
+        values_span=(values_start, section.stop),
+        positions=count,
+        non_nulls=non_nulls,
+        row_starts=rows,
+        first_repetition_level=first,
+    )

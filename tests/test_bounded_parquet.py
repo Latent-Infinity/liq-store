@@ -6343,5 +6343,959 @@ class PageHeaderAdmissionTests(unittest.TestCase):
         self.assertEqual(tuple(getattr(budget, axis) for axis in self.body_axes), (0,) * 5)
 
 
+class PageLevelScanTests(unittest.TestCase):
+    def api(self) -> SimpleNamespace:
+        found = {}
+        for name in ("_PageLevelInput", "_PageLevelSummary", "_scan_page_levels"):
+            value = getattr(bounded_parquet, name, None)
+            self.assertTrue(callable(value), f"missing callable {name}")
+            found[name] = value
+        return SimpleNamespace(**found)
+
+    def budget(self, **changes: int) -> bounded_parquet._PageBudget:
+        limits = dict.fromkeys(("max_" + axis for axis in PageBudgetTests.axes), 1 << 40)
+        limits.update(changes)
+        return PageBudgetTests().budget(**limits)
+
+    def section(self, version: str = "v1", **changes):
+        api = self.api()
+        n = changes.pop("n", 8)
+        max_def = changes.pop("max_def", 7)
+        max_rep = changes.pop("max_rep", 0)
+        repetition = changes.pop("repetition", b"")
+        definition = changes.pop("definition", b"\x03\x88\xc6\xfa")
+        prefix = changes.pop("prefix", b"")
+        suffix = changes.pop("suffix", b"\xa5")
+        outside = changes.pop("outside", b"")
+        def_encoding = changes.pop("def_encoding", 3)
+        rep_encoding = changes.pop("rep_encoding", 3)
+        nulls = changes.pop("nulls", 0 if max_def == 0 else max(n - 1, 0))
+        rows = changes.pop("rows", n)
+        compression = changes.pop("compression", None)
+        self.assertFalse(changes, f"unknown section options {tuple(changes)}")
+        if version == "v1":
+            if max_rep > 0 and rep_encoding == 3:
+                repetition = len(repetition).to_bytes(4, "little") + repetition
+            if max_def > 0 and def_encoding == 3:
+                definition = len(definition).to_bytes(4, "little") + definition
+            header = bounded_parquet._PageDataV1Header(n, 0, def_encoding, rep_encoding, None)
+        else:
+            self.assertEqual(version, "v2")
+            header = bounded_parquet._PageDataV2Header(
+                num_values=n,
+                num_nulls=nulls,
+                num_rows=rows,
+                encoding=0,
+                definition_levels_byte_length=len(definition),
+                repetition_levels_byte_length=len(repetition),
+                is_compressed=compression,
+                effective_is_compressed=compression is not False,
+                statistics=None,
+            )
+        body = repetition + definition + suffix
+        return api._PageLevelInput(
+            payload=prefix + body + outside,
+            start=len(prefix),
+            stop=len(prefix) + len(body),
+            header=header,
+            max_definition_level=max_def,
+            max_repetition_level=max_rep,
+        )
+
+    def forged(self, record, **changes):
+        from dataclasses import replace
+
+        copy = replace(record)
+        for name, value in changes.items():
+            object.__setattr__(copy, name, value)
+        return copy
+
+    def scan(self, section, budget=None):
+        if budget is None:
+            budget = self.budget()
+        api = self.api()
+        result = api._scan_page_levels(section, budget=budget)
+        self.assertIsInstance(result, api._PageLevelSummary)
+        return result, budget
+
+    def refused(self, section, reason: str, budget=None):
+        if budget is None:
+            budget = self.budget()
+        with self.assertRaises(
+            (PinnedReadRefused, bounded_parquet._CompactWireMalformed)
+        ) as raised:
+            self.api()._scan_page_levels(section, budget=budget)
+        self.assertEqual(raised.exception.reason_code, reason)
+        return budget
+
+    def counters(self, budget, **expected: int) -> None:
+        self.assertEqual(
+            PageBudgetTests().state(budget),
+            tuple(expected.get(axis, 0) for axis in PageBudgetTests.axes),
+        )
+        self.assertEqual(budget.wire_budget.total_wire_bytes, 0)
+        self.assertEqual(budget.wire_budget.work_units, 0)
+        self.assertEqual(budget.wire_budget.total_fields, 0)
+        self.assertEqual(budget.wire_budget.total_items, 0)
+        self.assertEqual(budget.wire_budget.total_string_bytes, 0)
+        self.assertEqual(budget.wire_budget.copied_payload_bytes, 0)
+        self.assertEqual(budget.read_budget.source_opens, 0)
+        self.assertEqual(budget.read_budget.total_read_bytes, 0)
+
+    def counts(self, result, *, positions=8, non_nulls=1, rows=8, first=0) -> None:
+        self.assertEqual(
+            (
+                result.positions,
+                result.non_nulls,
+                result.row_starts,
+                result.first_repetition_level,
+            ),
+            (positions, non_nulls, rows, first),
+        )
+
+    def positive_cases(self):
+        shared = (
+            ("hybrid", {}, 36, 32, (8, 1, 8, 0)),
+            (
+                "asymmetric",
+                {
+                    "max_rep": 3,
+                    "max_def": 3,
+                    "repetition": b"\x03\xc0\x00",
+                    "definition": b"\x10\x03",
+                    "nulls": 0,
+                    "rows": 7,
+                },
+                43,
+                35,
+                (8, 8, 7, 0),
+            ),
+            (
+                "multibyte",
+                {"n": 3, "max_def": 0x1234, "definition": b"\x06\x34\x12", "nulls": 0},
+                20,
+                16,
+                (3, 3, 3, 0),
+            ),
+            (
+                "repeat",
+                {"n": 3, "max_def": 2, "definition": b"\x06\x02", "nulls": 0},
+                19,
+                15,
+                (3, 3, 3, 0),
+            ),
+            (
+                "repeat-zero",
+                {"n": 3, "max_def": 2, "definition": b"\x06\x00", "nulls": 3},
+                19,
+                15,
+                (3, 0, 3, 0),
+            ),
+            ("literal-tail", {"n": 5, "max_def": 5, "nulls": 5}, 27, 23, (5, 0, 5, 0)),
+            (
+                "repeat-to-literal",
+                {
+                    "max_rep": 3,
+                    "max_def": 3,
+                    "repetition": b"\x04\x00\x03\x84\x0c",
+                    "definition": b"\x06\x03\x0a\x02",
+                    "nulls": 5,
+                    "rows": 5,
+                },
+                49,
+                41,
+                (8, 3, 5, 0),
+            ),
+            (
+                "literal-to-repeat",
+                {
+                    "n": 11,
+                    "max_rep": 3,
+                    "max_def": 3,
+                    "repetition": b"\x03\xc0\x00\x06\x00",
+                    "definition": b"\x16\x03",
+                    "nulls": 0,
+                    "rows": 10,
+                },
+                55,
+                47,
+                (11, 11, 10, 0),
+            ),
+            (
+                "nonminimal-varint",
+                {"definition": b"\x83\x00\x88\xc6\xfa"},
+                37,
+                33,
+                (8, 1, 8, 0),
+            ),
+            (
+                "maximum-width",
+                {"n": 1, "max_def": (1 << 64) - 1, "definition": b"\x02" + b"\xff" * 8, "nulls": 0},
+                20,
+                16,
+                (1, 1, 1, 0),
+            ),
+            ("zero-active", {"n": 0, "definition": b"", "suffix": b""}, 7, 3, (0, 0, 0, None)),
+            (
+                "nonzero-offset",
+                {"prefix": b"\xff\xee", "outside": b"\x80\xff"},
+                36,
+                32,
+                (8, 1, 8, 0),
+            ),
+        )
+        cases = []
+        for name, options, v1_work, v2_work, counts in shared:
+            for version, work in (("v1", v1_work), ("v2", v2_work)):
+                cases.append((name, version, options, work, counts))
+        for n in (0, 1, (1 << 31) - 1):
+            for version in ("v1", "v2"):
+                cases.append(
+                    (
+                        f"implicit-{n}",
+                        version,
+                        {"n": n, "max_def": 0, "definition": b"", "nulls": 0},
+                        3,
+                        (n, n, n, 0 if n else None),
+                    )
+                )
+        cases.append(
+            (
+                "legacy",
+                "v1",
+                {"def_encoding": 4, "definition": b"\x05\x39\x77"},
+                30,
+                (8, 1, 8, 0),
+            )
+        )
+        cases.append(
+            (
+                "legacy-zero",
+                "v1",
+                {"n": 0, "def_encoding": 4, "definition": b"", "suffix": b""},
+                3,
+                (0, 0, 0, None),
+            )
+        )
+        for raw in (b"\x00", b"\x40", b"\x80", b"\xc0"):
+            cases.append(
+                (
+                    f"legacy-last-{raw.hex()}",
+                    "v1",
+                    {"n": 1, "max_def": 3, "def_encoding": 4, "definition": raw, "suffix": b""},
+                    7,
+                    (1, 1 if raw == b"\xc0" else 0, 1, 0),
+                )
+            )
+        for rep_encoding, def_encoding, repetition, definition, work, first in (
+            (4, 3, b"\xc0\x00", b"\x10\x03", 37, 3),
+            (3, 4, b"\x03\xc0\x00", b"\xff\xff", 38, 0),
+        ):
+            cases.append(
+                (
+                    f"mixed-{rep_encoding}-{def_encoding}",
+                    "v1",
+                    {
+                        "max_rep": 3,
+                        "max_def": 3,
+                        "rep_encoding": rep_encoding,
+                        "def_encoding": def_encoding,
+                        "repetition": repetition,
+                        "definition": definition,
+                    },
+                    work,
+                    (8, 8, 7, first),
+                )
+            )
+        for flag in (None, False, True):
+            cases.append(
+                (
+                    f"opaque-{flag}",
+                    "v2",
+                    {"compression": flag, "suffix": b"\xff\x80\x00\xff"},
+                    32,
+                    (8, 1, 8, 0),
+                )
+            )
+        return cases
+
+    def test_private_input_and_summary_have_only_the_adopted_frozen_fields(self) -> None:
+        from dataclasses import FrozenInstanceError, fields
+
+        api = self.api()
+        self.assertEqual(
+            tuple(field.name for field in fields(api._PageLevelInput)),
+            (
+                "payload",
+                "start",
+                "stop",
+                "header",
+                "max_definition_level",
+                "max_repetition_level",
+            ),
+        )
+        self.assertEqual(
+            tuple(field.name for field in fields(api._PageLevelSummary)),
+            (
+                "repetition_span",
+                "definition_span",
+                "values_span",
+                "positions",
+                "non_nulls",
+                "row_starts",
+                "first_repetition_level",
+            ),
+        )
+        section = self.section()
+        result, _ = self.scan(section)
+        self.assertFalse(hasattr(section, "__dict__"))
+        self.assertFalse(hasattr(result, "__dict__"))
+        for record, name in ((section, "start"), (result, "positions")):
+            with self.assertRaises(FrozenInstanceError):
+                setattr(record, name, 1)
+
+    def test_normative_hybrid_vectors_have_exact_spans_counts_and_work(self) -> None:
+        for version, end, work in (("v1", 8, 36), ("v2", 4, 32)):
+            for prefix in (b"", b"\xff\xee"):
+                with self.subTest(version=version, offset=len(prefix)):
+                    section = self.section(version, prefix=prefix, outside=b"\x80\xff")
+                    result, budget = self.scan(section)
+                    start = len(prefix)
+                    self.assertEqual(result.repetition_span, (start, start))
+                    self.assertEqual(result.definition_span, (start, start + end))
+                    self.assertEqual(result.values_span, (start + end, start + end + 1))
+                    self.counts(result)
+                    self.counters(budget, levels=16, work_units=work)
+
+    def test_asymmetric_repetition_vector_distinguishes_hybrid_bit_order(self) -> None:
+        for version, rep_end, def_end, work in (
+            ("v1", 7, 13, 43),
+            ("v2", 3, 5, 35),
+        ):
+            with self.subTest(version=version):
+                section = self.section(
+                    version,
+                    max_rep=3,
+                    max_def=3,
+                    repetition=b"\x03\xc0\x00",
+                    definition=b"\x10\x03",
+                    nulls=0,
+                    rows=7,
+                )
+                result, budget = self.scan(section)
+                self.assertEqual(result.repetition_span, (0, rep_end))
+                self.assertEqual(result.definition_span, (rep_end, def_end))
+                self.assertEqual(result.values_span, (def_end, def_end + 1))
+                self.counts(result, non_nulls=8, rows=7, first=0)
+                self.counters(budget, levels=16, work_units=work)
+
+    def test_multibyte_repeated_scalar_is_little_endian(self) -> None:
+        for version, end, work in (("v1", 7, 20), ("v2", 3, 16)):
+            with self.subTest(version=version):
+                section = self.section(
+                    version,
+                    n=3,
+                    max_def=0x1234,
+                    definition=b"\x06\x34\x12",
+                    nulls=0,
+                )
+                result, budget = self.scan(section)
+                self.assertEqual(result.definition_span, (0, end))
+                self.counts(result, positions=3, non_nulls=3, rows=3)
+                self.counters(budget, levels=6, work_units=work)
+
+    def test_multiple_runs_with_different_stream_boundaries_reconcile(self) -> None:
+        cases = (
+            (8, b"\x04\x00\x03\x84\x0c", b"\x06\x03\x0a\x02", 3, 5, 49, 41),
+            (11, b"\x03\xc0\x00\x06\x00", b"\x16\x03", 11, 10, 55, 47),
+        )
+        for n, repetition, definition, non_nulls, rows, v1_work, v2_work in cases:
+            for version, rep_end, end, work in (
+                ("v1", 9, 17 if n == 8 else 15, v1_work),
+                ("v2", 5, 9 if n == 8 else 7, v2_work),
+            ):
+                with self.subTest(version=version, n=n):
+                    result, budget = self.scan(
+                        self.section(
+                            version,
+                            n=n,
+                            max_rep=3,
+                            max_def=3,
+                            repetition=repetition,
+                            definition=definition,
+                            nulls=n - non_nulls,
+                            rows=rows,
+                        )
+                    )
+                    self.assertEqual(result.repetition_span, (0, rep_end))
+                    self.assertEqual(result.definition_span, (rep_end, end))
+                    self.assertEqual(result.values_span, (end, end + 1))
+                    self.counts(result, positions=n, non_nulls=non_nulls, rows=rows)
+                    self.counters(budget, levels=2 * n, work_units=work)
+
+    def test_single_byte_repeated_scalar_has_independent_exact_accounting(self) -> None:
+        for version, work in (("v1", 19), ("v2", 15)):
+            with self.subTest(version=version):
+                section = self.section(version, n=3, max_def=2, definition=b"\x06\x02", nulls=0)
+                result, budget = self.scan(section)
+                self.counts(result, positions=3, non_nulls=3, rows=3)
+                self.counters(budget, levels=6, work_units=work)
+
+    def test_repeated_zero_level_is_distinct_from_a_missing_scalar(self) -> None:
+        for version, work in (("v1", 19), ("v2", 15)):
+            with self.subTest(version=version):
+                result, budget = self.scan(
+                    self.section(version, n=3, max_def=2, definition=b"\x06\x00", nulls=3)
+                )
+                self.counts(result, positions=3, non_nulls=0, rows=3)
+                self.counters(budget, levels=6, work_units=work)
+                self.refused(
+                    self.section(version, n=3, max_def=2, definition=b"\x06", nulls=3),
+                    "truncated_wire",
+                )
+
+    def test_v1_level_streams_use_their_own_encoding_declarations(self) -> None:
+        for rep_encoding, def_encoding, repetition, definition, rep_end, end, work, first in (
+            (4, 3, b"\xc0\x00", b"\x10\x03", 2, 8, 37, 3),
+            (3, 4, b"\x03\xc0\x00", b"\xff\xff", 7, 9, 38, 0),
+        ):
+            with self.subTest(rep_encoding=rep_encoding, def_encoding=def_encoding):
+                result, budget = self.scan(
+                    self.section(
+                        max_rep=3,
+                        max_def=3,
+                        rep_encoding=rep_encoding,
+                        def_encoding=def_encoding,
+                        repetition=repetition,
+                        definition=definition,
+                    )
+                )
+                self.assertEqual(result.repetition_span, (0, rep_end))
+                self.assertEqual(result.definition_span, (rep_end, end))
+                self.assertEqual(result.values_span, (end, end + 1))
+                self.counts(result, non_nulls=8, rows=7, first=first)
+                self.counters(budget, levels=16, work_units=work)
+
+    def test_legacy_vector_uses_msb_order_without_a_length_prefix(self) -> None:
+        section = self.section(def_encoding=4, definition=b"\x05\x39\x77", prefix=b"\xee")
+        result, budget = self.scan(section)
+        self.assertEqual(result.repetition_span, (1, 1))
+        self.assertEqual(result.definition_span, (1, 4))
+        self.assertEqual(result.values_span, (4, 5))
+        self.counts(result)
+        self.counters(budget, levels=16, work_units=30)
+
+    def test_legacy_last_byte_requires_zero_unused_bits(self) -> None:
+        for raw in (b"\x00", b"\x40", b"\x80", b"\xc0"):
+            with self.subTest(raw=raw):
+                result, budget = self.scan(
+                    self.section(n=1, max_def=3, def_encoding=4, definition=raw, suffix=b"")
+                )
+                self.counts(
+                    result,
+                    positions=1,
+                    non_nulls=1 if raw == b"\xc0" else 0,
+                    rows=1,
+                )
+                self.counters(budget, levels=2, work_units=7)
+        self.refused(
+            self.section(n=1, max_def=3, def_encoding=4, definition=b"\x01"),
+            "schema_mismatch",
+        )
+
+    def test_terminal_literal_padding_has_no_logical_range_or_null_observations(self) -> None:
+        for version, work in (("v1", 27), ("v2", 23)):
+            with self.subTest(version=version):
+                result, budget = self.scan(self.section(version, n=5, max_def=5, nulls=5))
+                self.counts(result, positions=5, non_nulls=0, rows=5)
+                self.counters(budget, levels=10, work_units=work)
+
+    def test_repeated_surplus_and_extra_complete_literal_groups_are_unsupported(self) -> None:
+        for version in ("v1", "v2"):
+            for raw in (
+                b"\x12\x07",
+                b"\xfe\xff\xff\xff\x0f\x07",
+                b"\x05" + b"\x00" * 6,
+            ):
+                with self.subTest(version=version, raw=raw):
+                    self.refused(self.section(version, definition=raw), "unsupported_mode")
+
+    def test_trailing_section_content_is_not_parsed_to_salvage_a_result(self) -> None:
+        for version in ("v1", "v2"):
+            for tail in (b"\x02\x00", b"\x00", b"\x80" * 6):
+                with self.subTest(version=version, tail=tail):
+                    self.refused(
+                        self.section(version, definition=b"\x03\x88\xc6\xfa" + tail),
+                        "unsupported_mode",
+                    )
+
+    def test_each_truncated_literal_prefix_refuses_even_if_some_values_fit(self) -> None:
+        for version in ("v1", "v2"):
+            for end in range(4):
+                with self.subTest(version=version, end=end):
+                    self.refused(
+                        self.section(version, definition=b"\x03\x88\xc6\xfa"[:end]),
+                        "truncated_wire",
+                    )
+        self.refused(
+            self.section("v2", n=1, definition=b"\x03\x00", nulls=1),
+            "truncated_wire",
+        )
+
+    def test_v1_prefix_and_v2_declared_sections_cannot_read_beyond_the_span(self) -> None:
+        for version in ("v1", "v2"):
+            section = self.section(version)
+            for end in range(4):
+                with self.subTest(version=version, end=end):
+                    self.refused(self.forged(section, stop=end), "truncated_wire")
+        section = self.section()
+        changed = bytearray(section.payload)
+        changed[:4] = b"\xff\xff\xff\xff"
+        self.refused(self.forged(section, payload=bytes(changed)), "truncated_wire")
+
+    def test_zero_overflowing_and_unterminated_run_headers_are_malformed(self) -> None:
+        cases = (
+            b"\x00",
+            b"\x01",
+            b"\x80" * 5,
+            b"\x80" * 5 + b"\x00",
+            b"\xff\xff\xff\xff\x10",
+            b"\xff\xff\xff\xff\x0f",
+        )
+        for version in ("v1", "v2"):
+            for raw in cases:
+                with self.subTest(version=version, raw=raw):
+                    self.refused(self.section(version, definition=raw), "schema_mismatch")
+        for version in ("v1", "v2"):
+            self.refused(self.section(version, definition=b"\x80"), "truncated_wire")
+
+    def test_nonminimal_but_bounded_run_varint_is_not_rejected_as_noncanonical(self) -> None:
+        for version, work in (("v1", 37), ("v2", 33)):
+            with self.subTest(version=version):
+                result, budget = self.scan(
+                    self.section(version, definition=b"\x83\x00\x88\xc6\xfa")
+                )
+                self.counts(result)
+                self.counters(budget, levels=16, work_units=work)
+
+    def test_logical_values_outside_the_schema_maximum_refuse(self) -> None:
+        for version in ("v1", "v2"):
+            for raw in (b"\x10\x07", b"\x03\xff\xff"):
+                with self.subTest(version=version, raw=raw):
+                    self.refused(
+                        self.section(version, max_def=2, definition=raw),
+                        "schema_mismatch",
+                    )
+
+    def test_v2_null_and_row_counts_must_match_the_scanned_levels(self) -> None:
+        for changes in (
+            {"nulls": 6},
+            {"rows": 7},
+            {"nulls": 8},
+        ):
+            with self.subTest(changes=changes):
+                self.refused(self.section("v2", **changes), "schema_mismatch")
+
+    def test_v1_can_continue_a_row_but_v2_must_begin_at_repetition_zero(self) -> None:
+        changes = {
+            "max_def": 3,
+            "max_rep": 3,
+            "repetition": b"\x03\x03\x00",
+            "definition": b"\x10\x03",
+            "nulls": 0,
+            "rows": 7,
+        }
+        result, budget = self.scan(self.section("v1", **changes))
+        self.counts(result, non_nulls=8, rows=7, first=3)
+        self.counters(budget, levels=16, work_units=43)
+        self.refused(self.section("v2", **changes), "schema_mismatch")
+
+    def test_v2_opaque_value_remainder_is_untouched_for_each_compression_flag(self) -> None:
+        for flag in (None, False, True):
+            with self.subTest(flag=flag):
+                section = self.section("v2", compression=flag, suffix=b"\xff\x80\x00\xff")
+                result, budget = self.scan(section)
+                self.assertEqual(result.values_span, (4, 8))
+                self.assertEqual(section.payload[4:8], b"\xff\x80\x00\xff")
+                self.counts(result)
+                self.counters(budget, levels=16, work_units=32)
+
+    def test_implicit_streams_are_constant_space_and_charge_logical_positions(self) -> None:
+        for version in ("v1", "v2"):
+            for n in (0, 1, (1 << 31) - 1):
+                with self.subTest(version=version, n=n):
+                    section = self.section(version, n=n, max_def=0, definition=b"", nulls=0)
+                    result, budget = self.scan(
+                        section,
+                        self.budget(max_levels=max(1, 2 * n), max_work_units=3),
+                    )
+                    self.assertEqual(result.repetition_span, (0, 0))
+                    self.assertEqual(result.definition_span, (0, 0))
+                    self.assertEqual(result.values_span, (0, 1))
+                    self.counts(
+                        result,
+                        positions=n,
+                        non_nulls=n,
+                        rows=n,
+                        first=0 if n else None,
+                    )
+                    self.counters(budget, levels=2 * n, work_units=3)
+
+    def test_unused_v1_encoding_declarations_do_not_create_implicit_bytes(self) -> None:
+        for encoding in (0, 2, 3, 4, 5, 6, 7, 8, 9):
+            with self.subTest(encoding=encoding):
+                result, budget = self.scan(
+                    self.section(
+                        n=2,
+                        max_def=0,
+                        definition=b"",
+                        def_encoding=encoding,
+                        rep_encoding=encoding,
+                    )
+                )
+                self.counts(result, positions=2, non_nulls=2, rows=2)
+                self.assertEqual(result.values_span, (0, 1))
+                self.counters(budget, levels=4, work_units=3)
+
+    def test_zero_positions_preserve_each_active_streams_framing(self) -> None:
+        for version, encoding, end, work in (
+            ("v1", 3, 4, 7),
+            ("v1", 4, 0, 3),
+            ("v2", 3, 0, 3),
+        ):
+            with self.subTest(version=version, encoding=encoding):
+                result, budget = self.scan(
+                    self.section(version, n=0, definition=b"", def_encoding=encoding, suffix=b"")
+                )
+                self.assertEqual(result.definition_span, (0, end))
+                self.assertEqual(result.values_span, (end, end))
+                self.counts(result, positions=0, non_nulls=0, rows=0, first=None)
+                self.counters(budget, levels=0, work_units=work)
+
+    def test_v2_nonempty_zero_width_sections_are_explicitly_unsupported(self) -> None:
+        for changes in (
+            {"max_def": 0, "definition": b"\x02"},
+            {"max_rep": 0, "repetition": b"\x02"},
+        ):
+            with self.subTest(changes=changes):
+                self.refused(self.section("v2", **changes), "unsupported_mode")
+
+    def test_exact_and_one_below_level_and_work_limits(self) -> None:
+        for name, version, options, work, counts in self.positive_cases():
+            with self.subTest(name=name, version=version):
+                n, non_nulls, rows, first = counts
+                section = self.section(version, **options)
+                result, budget = self.scan(
+                    section,
+                    self.budget(max_levels=max(1, 2 * n), max_work_units=work),
+                )
+                self.counts(result, positions=n, non_nulls=non_nulls, rows=rows, first=first)
+                self.counters(budget, levels=2 * n, work_units=work)
+                if n:
+                    budget = self.budget(max_levels=2 * n - 1)
+                    self.refused(section, "resource_limit", budget)
+                    self.counters(budget)
+                budget = self.budget(max_work_units=work - 1)
+                self.refused(section, "resource_limit", budget)
+                self.counters(budget, levels=2 * n, work_units=work - 1)
+
+    def test_active_reservation_boundaries_refuse_atomically_and_check_deadline(self) -> None:
+        section = self.section()
+        for ceiling, spent in (
+            (1, 1),
+            (2, 2),
+            (6, 6),
+            (7, 7),
+            (8, 8),
+            (10, 8),
+            (11, 11),
+            (12, 12),
+            (13, 13),
+            (35, 35),
+        ):
+            with self.subTest(ceiling=ceiling):
+                budget = self.budget(max_work_units=ceiling)
+                self.refused(section, "resource_limit", budget)
+                self.counters(budget, levels=16, work_units=spent)
+        for prefix in (1, 2, 6, 7, 8, 11, 12, 13, 35):
+            with self.subTest(deadline_prefix=prefix):
+                budget = self.budget()
+                reserve = budget.reserve
+                now = [0]
+                reached = [False]
+
+                def expire_at_prefix(
+                    charge,
+                    *,
+                    reserve=reserve,
+                    budget=budget,
+                    now=now,
+                    reached=reached,
+                    prefix=prefix,
+                ):
+                    reserve(charge)
+                    if budget.work_units == prefix:
+                        reached[0] = True
+                        now[0] = 10
+
+                with (
+                    patch.object(
+                        budget.read_budget, "clock_ns", side_effect=lambda now=now: now[0]
+                    ),
+                    patch.object(budget, "reserve", expire_at_prefix),
+                ):
+                    self.refused(section, "deadline_exceeded", budget)
+                self.assertTrue(reached[0])
+                self.counters(budget, levels=16, work_units=prefix)
+
+    def test_repeated_scans_accumulate_without_reset_or_refund(self) -> None:
+        section = self.section()
+        budget = self.budget(max_levels=32, max_work_units=72)
+        for _ in range(2):
+            result, _ = self.scan(section, budget)
+            self.counts(result)
+        self.counters(budget, levels=32, work_units=72)
+        self.refused(section, "resource_limit", budget)
+        self.counters(budget, levels=32, work_units=72)
+
+    def test_malformed_scan_retains_entry_and_completed_work_reservations(self) -> None:
+        for version, spent, total in (("v1", 8, 44), ("v2", 4, 36)):
+            with self.subTest(version=version):
+                budget = self.budget()
+                self.refused(
+                    self.section(version, definition=b"\x03\x88"),
+                    "truncated_wire",
+                    budget,
+                )
+                self.counters(budget, levels=16, work_units=spent)
+                result, _ = self.scan(self.section(version), budget)
+                self.counts(result)
+                self.counters(budget, levels=32, work_units=total)
+
+    def test_scanner_does_not_recharge_header_values_or_touch_other_axes(self) -> None:
+        budget = self.budget()
+        budget.reserve(
+            bounded_parquet._PageCharge(values=8, compressed_bytes=16, uncompressed_bytes=20)
+        )
+        result, _ = self.scan(self.section(), budget)
+        self.counts(result)
+        self.counters(
+            budget,
+            values=8,
+            compressed_bytes=16,
+            uncompressed_bytes=20,
+            levels=16,
+            work_units=36,
+        )
+
+    def test_invalid_input_fields_refuse_before_clock_or_counter_mutation(self) -> None:
+        class IntegerSubclass(int):
+            pass
+
+        class PayloadSubclass(bytes):
+            pass
+
+        base = self.section()
+        cases = [
+            {"payload": value}
+            for value in (
+                None,
+                "bytes",
+                bytearray(base.payload),
+                memoryview(base.payload),
+                PayloadSubclass(base.payload),
+            )
+        ]
+        cases += [
+            {name: value}
+            for name in ("start", "stop")
+            for value in (True, 0.0, IntegerSubclass(0), -1, len(base.payload) + 1)
+        ]
+        cases += [
+            {"start": 2, "stop": 1},
+            {"header": SimpleNamespace()},
+            {"header": bounded_parquet._PageDictionaryHeader(1, 0, None)},
+            {"max_definition_level": -1},
+            {"max_definition_level": True},
+            {"max_definition_level": 1.0},
+            {"max_definition_level": IntegerSubclass(7)},
+            {"max_repetition_level": -1},
+            {"max_repetition_level": True},
+            {"max_repetition_level": 1.0},
+            {"max_repetition_level": IntegerSubclass(0)},
+            {"max_repetition_level": 8},
+        ]
+        for changes in cases:
+            with self.subTest(changes=tuple(changes)):
+                section = self.forged(base, **changes)
+                budget = self.budget()
+                with patch.object(
+                    budget.read_budget,
+                    "clock_ns",
+                    side_effect=AssertionError("invalid input reached clock"),
+                ):
+                    self.refused(section, "invalid_contract", budget)
+                self.counters(budget)
+
+    def test_wrong_input_and_budget_types_are_not_duck_typed(self) -> None:
+        from dataclasses import fields
+
+        class BudgetSubclass(bounded_parquet._PageBudget):
+            pass
+
+        class HeaderSubclass(bounded_parquet._PageDataV1Header):
+            pass
+
+        section = self.section()
+        input_subclass = type("InputSubclass", (type(section),), {})
+        derived = input_subclass(
+            **{field.name: getattr(section, field.name) for field in fields(section)}
+        )
+        for bad in (None, SimpleNamespace(), section.payload, derived):
+            budget = self.budget()
+            with (
+                self.subTest(input_type=type(bad).__name__),
+                patch.object(
+                    budget.read_budget,
+                    "clock_ns",
+                    side_effect=AssertionError("wrong input type reached clock"),
+                ),
+            ):
+                self.refused(bad, "invalid_contract", budget)
+            self.counters(budget)
+        budget = self.budget()
+        with patch.object(
+            budget.read_budget,
+            "clock_ns",
+            side_effect=AssertionError("header subclass reached clock"),
+        ):
+            self.refused(
+                self.forged(section, header=HeaderSubclass(8, 0, 3, 3, None)),
+                "invalid_contract",
+                budget,
+            )
+        self.counters(budget)
+        valid = self.budget()
+        derived_budget = BudgetSubclass(
+            read_budget=valid.read_budget,
+            wire_budget=valid.wire_budget,
+            limits=valid.limits,
+        )
+        for bad in (None, SimpleNamespace(), derived_budget):
+            with (
+                self.subTest(budget_type=type(bad).__name__),
+                self.assertRaises(PinnedReadRefused) as raised,
+            ):
+                self.api()._scan_page_levels(section, budget=bad)
+            self.assertEqual(raised.exception.reason_code, "invalid_contract")
+
+    def test_invalid_header_scalars_are_revalidated_before_clock(self) -> None:
+        cases = [
+            (version, "num_values", value)
+            for version in ("v1", "v2")
+            for value in (-1, True, 1.0, 1 << 31)
+        ]
+        cases += [
+            ("v2", name, value)
+            for name in (
+                "num_nulls",
+                "num_rows",
+                "definition_levels_byte_length",
+                "repetition_levels_byte_length",
+            )
+            for value in (-1, True, 1.0, 1 << 31)
+        ]
+        cases += [
+            ("v1", "definition_level_encoding", True),
+            ("v1", "repetition_level_encoding", 1.0),
+            ("v2", "num_nulls", 9),
+            ("v2", "num_rows", 9),
+            ("v2", "is_compressed", 1),
+            ("v2", "effective_is_compressed", None),
+            ("v2", "effective_is_compressed", False),
+        ]
+        for version, name, value in cases:
+            with self.subTest(version=version, field=name, value=value):
+                section = self.section(version)
+                section = self.forged(section, header=self.forged(section.header, **{name: value}))
+                budget = self.budget()
+                with patch.object(
+                    budget.read_budget,
+                    "clock_ns",
+                    side_effect=AssertionError("invalid header reached clock"),
+                ):
+                    self.refused(section, "invalid_contract", budget)
+                self.counters(budget)
+
+    def test_unsupported_active_encodings_and_widths_do_not_become_profiles(self) -> None:
+        for encoding in (0, 2, 5, 6, 7, 8, 9):
+            with self.subTest(encoding=encoding):
+                self.refused(self.section(def_encoding=encoding), "unsupported_mode")
+        self.refused(self.section(max_def=1 << 64), "unsupported_mode")
+
+    def test_maximum_supported_level_width_has_bounded_scalar_state(self) -> None:
+        for version, work in (("v1", 20), ("v2", 16)):
+            with self.subTest(version=version):
+                result, budget = self.scan(
+                    self.section(
+                        version,
+                        n=1,
+                        max_def=(1 << 64) - 1,
+                        definition=b"\x02" + b"\xff" * 8,
+                        nulls=0,
+                    )
+                )
+                self.counts(result, positions=1, non_nulls=1, rows=1)
+                self.counters(budget, levels=2, work_units=work)
+
+    def test_entry_deadline_prevents_all_level_and_work_charges(self) -> None:
+        section = self.section()
+        budget = self.budget()
+        with patch.object(budget.read_budget, "clock_ns", return_value=10):
+            self.refused(section, "deadline_exceeded", budget)
+        self.counters(budget)
+
+    def test_deadline_after_entry_preserves_only_the_atomic_entry_charge(self) -> None:
+        section = self.section()
+        budget = self.budget()
+        reserve = budget.reserve
+        now = [0]
+        calls = []
+
+        def expire_after_entry(charge):
+            reserve(charge)
+            calls.append(charge)
+            now[0] = 10
+
+        with (
+            patch.object(budget.read_budget, "clock_ns", side_effect=lambda: now[0]),
+            patch.object(budget, "reserve", expire_after_entry),
+        ):
+            self.refused(section, "deadline_exceeded", budget)
+        self.assertEqual(len(calls), 1)
+        self.counters(budget, levels=16, work_units=1)
+
+    def test_late_deadline_prevents_summary_after_implicit_counts(self) -> None:
+        section = self.section(n=3, max_def=0, definition=b"")
+        budget = self.budget()
+        reserve = budget.reserve
+        now = [0]
+        calls = []
+
+        def expire_before_summary(charge):
+            reserve(charge)
+            calls.append(charge)
+            if len(calls) == 2:
+                now[0] = 10
+
+        with (
+            patch.object(budget.read_budget, "clock_ns", side_effect=lambda: now[0]),
+            patch.object(budget, "reserve", expire_before_summary),
+        ):
+            self.refused(section, "deadline_exceeded", budget)
+        self.assertEqual(len(calls), 2)
+        self.counters(budget, levels=6, work_units=2)
+
+
 if __name__ == "__main__":
     unittest.main()
