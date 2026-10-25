@@ -3330,3 +3330,37 @@ def _scan_page_levels(section: _PageLevelInput, *, budget: _PageBudget) -> _Page
         row_starts=rows,
         first_repetition_level=first,
     )
+
+
+def _verify_page_crc(
+    payload: bytes,
+    *,
+    start: int,
+    stop: int,
+    crc: int | None,
+    budget: _PageBudget,
+) -> None:
+    if (
+        type(payload) is not bytes
+        or type(start) is not int
+        or type(stop) is not int
+        or type(budget) is not _PageBudget
+        or (crc is not None and (type(crc) is not int or not -(1 << 31) <= crc < (1 << 31)))
+        or not 0 <= start <= stop <= len(payload)
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    _page_work(budget)
+    if crc is None:
+        _page_work(budget)
+        return
+    register = 0xFFFFFFFF
+    # Scalar updates keep checksum work interruptible by the shared deadline.
+    for position in range(start, stop):
+        _page_work(budget)
+        register ^= payload[position]
+        for _ in range(8):
+            _page_work(budget)
+            register = (register >> 1) ^ (0xEDB88320 if register & 1 else 0)
+    _page_work(budget)
+    if (register ^ 0xFFFFFFFF) != (crc & 0xFFFFFFFF):
+        raise _CompactWireMalformed("invalid_wire")

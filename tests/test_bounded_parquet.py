@@ -7299,3 +7299,230 @@ class PageLevelScanTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PageChecksumTests(unittest.TestCase):
+    vectors = (
+        (b"", 0x00000000),
+        (b"123456789", 0xCBF43926 - (1 << 32)),
+        (b"abc", 0x352441C2),
+        (b"\x00", 0xD202EF8D - (1 << 32)),
+        (b"\xff", 0xFF000000 - (1 << 32)),
+    )
+
+    def api(self) -> SimpleNamespace:
+        value = getattr(bounded_parquet, "_verify_page_crc", None)
+        self.assertTrue(callable(value), "missing callable _verify_page_crc")
+        return SimpleNamespace(verify=value)
+
+    def budget(self, **changes: int) -> bounded_parquet._PageBudget:
+        limits = dict.fromkeys(("max_" + axis for axis in PageBudgetTests.axes), 1 << 40)
+        limits.update(changes)
+        return PageBudgetTests().budget(**limits)
+
+    def state(self, budget: bounded_parquet._PageBudget) -> dict[str, int]:
+        return {axis: getattr(budget, axis) for axis in PageBudgetTests.axes}
+
+    def assert_work(
+        self,
+        budget: bounded_parquet._PageBudget,
+        before: dict[str, int],
+        amount: int,
+    ) -> None:
+        expected = before.copy()
+        expected["work_units"] += amount
+        self.assertEqual(self.state(budget), expected)
+
+    def test_private_callable_has_exact_keyword_only_boundary(self) -> None:
+        import inspect
+
+        parameters = inspect.signature(self.api().verify).parameters
+        self.assertEqual(tuple(parameters), ("payload", "start", "stop", "crc", "budget"))
+        self.assertEqual(parameters["payload"].kind, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        for name in ("start", "stop", "crc", "budget"):
+            self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertIs(parameters[name].default, inspect.Parameter.empty)
+
+    def test_standard_anchors_preserve_other_page_wire_and_io_counters(self) -> None:
+        api = self.api()
+        for payload, crc in self.vectors:
+            with self.subTest(payload=payload):
+                budget = self.budget()
+                before = self.state(budget)
+                read_before = vars(budget.read_budget).copy()
+                wire_before = vars(budget.wire_budget).copy()
+                self.assertIsNone(
+                    api.verify(payload, start=0, stop=len(payload), crc=crc, budget=budget)
+                )
+                self.assert_work(budget, before, 2 + 9 * len(payload))
+                self.assertEqual(vars(budget.read_budget), read_before)
+                self.assertEqual(vars(budget.wire_budget), wire_before)
+
+    def test_nonzero_spans_ignore_changed_header_and_trailing_bytes(self) -> None:
+        api = self.api()
+        for payload, crc in self.vectors:
+            for prefix, suffix in ((b"header", b"tail"), (b"\xff\x00", b"\x00\xffmore")):
+                with self.subTest(payload=payload, prefix=prefix):
+                    budget = self.budget()
+                    before = self.state(budget)
+                    self.assertIsNone(
+                        api.verify(
+                            prefix + payload + suffix,
+                            start=len(prefix),
+                            stop=len(prefix) + len(payload),
+                            crc=crc,
+                            budget=budget,
+                        )
+                    )
+                    self.assert_work(budget, before, 2 + 9 * len(payload))
+
+    def test_absent_checksum_has_constant_work_and_present_zero_is_checked(self) -> None:
+        api = self.api()
+        for payload in (b"", b"abc", b"123456789"):
+            with self.subTest(absent_payload=payload):
+                budget = self.budget()
+                before = self.state(budget)
+                self.assertIsNone(
+                    api.verify(payload, start=0, stop=len(payload), crc=None, budget=budget)
+                )
+                self.assert_work(budget, before, 2)
+        budget = self.budget()
+        with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+            api.verify(b"\x00", start=0, stop=1, crc=0, budget=budget)
+        self.assertEqual(caught.exception.reason_code, "invalid_wire")
+        self.assertEqual(str(caught.exception), "invalid_wire")
+        self.assertEqual(budget.work_units, 11)
+
+    def test_each_mismatch_is_corruption_and_retains_full_work(self) -> None:
+        api = self.api()
+        for payload, crc in self.vectors:
+            with self.subTest(payload=payload):
+                budget = self.budget()
+                before = self.state(budget)
+                with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+                    api.verify(payload, start=0, stop=len(payload), crc=crc ^ 1, budget=budget)
+                self.assertEqual(caught.exception.reason_code, "invalid_wire")
+                self.assertEqual(str(caught.exception), "invalid_wire")
+                self.assert_work(budget, before, 2 + 9 * len(payload))
+
+    def test_every_positive_vector_has_exact_and_one_below_work_boundary(self) -> None:
+        api = self.api()
+        cases = self.vectors + ((b"123456789", None),)
+        for payload, crc in cases:
+            required = 2 if crc is None else 2 + 9 * len(payload)
+            with self.subTest(payload=payload, crc=crc, allowance=required):
+                budget = self.budget(max_work_units=required)
+                before = self.state(budget)
+                self.assertIsNone(
+                    api.verify(payload, start=0, stop=len(payload), crc=crc, budget=budget)
+                )
+                self.assert_work(budget, before, required)
+            with self.subTest(payload=payload, crc=crc, allowance=required - 1):
+                budget = self.budget(max_work_units=required - 1)
+                before = self.state(budget)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    api.verify(payload, start=0, stop=len(payload), crc=crc, budget=budget)
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                self.assert_work(budget, before, required - 1)
+
+    def test_cumulative_calls_do_not_recharge_declared_body_dimensions(self) -> None:
+        api = self.api()
+        budget = self.budget(max_work_units=24)
+        budget.reserve(
+            bounded_parquet._PageCharge(
+                work_units=2, compressed_bytes=1, uncompressed_bytes=1, values=1
+            )
+        )
+        before = self.state(budget)
+        for _ in range(2):
+            self.assertIsNone(
+                api.verify(b"\x00", start=0, stop=1, crc=0xD202EF8D - (1 << 32), budget=budget)
+            )
+        self.assert_work(budget, before, 22)
+        full = self.state(budget)
+        with self.assertRaises(PinnedReadRefused) as caught:
+            api.verify(b"", start=0, stop=0, crc=0, budget=budget)
+        self.assertEqual(caught.exception.reason_code, "resource_limit")
+        self.assertEqual(self.state(budget), full)
+
+    def test_final_resource_refusal_precedes_checksum_mismatch(self) -> None:
+        api = self.api()
+        for payload in (b"", b"\x00"):
+            required = 2 + 9 * len(payload)
+            with self.subTest(payload=payload):
+                budget = self.budget(max_work_units=required - 1)
+                before = self.state(budget)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    api.verify(payload, start=0, stop=len(payload), crc=1, budget=budget)
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                self.assert_work(budget, before, required - 1)
+
+    def test_deadline_at_each_checkpoint_retains_only_admitted_work(self) -> None:
+        api = self.api()
+        for payload, crc, required in (
+            (b"\x00", 0xD202EF8D - (1 << 32), 11),
+            (b"abc", None, 2),
+            (b"", 1, 2),
+        ):
+            for fail_at in range(1, required + 1):
+                with self.subTest(payload=payload, crc=crc, fail_at=fail_at):
+                    budget = self.budget()
+                    before = self.state(budget)
+                    calls = [0]
+
+                    def clock(failure: int = fail_at, count: list[int] = calls) -> int:
+                        count[0] += 1
+                        return 10 if count[0] == failure else 0
+
+                    budget.read_budget.clock_ns = clock
+                    with self.assertRaises(PinnedReadRefused) as caught:
+                        api.verify(payload, start=0, stop=len(payload), crc=crc, budget=budget)
+                    self.assertEqual(caught.exception.reason_code, "deadline_exceeded")
+                    self.assertEqual(calls[0], fail_at)
+                    self.assert_work(budget, before, fail_at - 1)
+
+    def test_invalid_arguments_precede_clock_and_leave_all_counters_unchanged(self) -> None:
+        api = self.api()
+
+        class DerivedBytes(bytes):
+            pass
+
+        class DerivedInt(int):
+            pass
+
+        class DerivedBudget(bounded_parquet._PageBudget):
+            pass
+
+        cases = [
+            {"payload": value}
+            for value in (None, bytearray(b"x"), memoryview(b"x"), "x", DerivedBytes(b"x"))
+        ]
+        cases += [{"start": value} for value in (None, False, 0.0, DerivedInt(0), -1, 2)]
+        cases += [{"stop": value} for value in (None, True, 1.0, DerivedInt(1), -1, 2)]
+        cases += [
+            {"crc": value}
+            for value in (False, 0.0, "0", DerivedInt(0), -(1 << 31) - 1, 1 << 31, 0xFFFFFFFF)
+        ]
+        cases += [
+            {"budget": value} for value in (None, SimpleNamespace(), object.__new__(DerivedBudget))
+        ]
+        cases.append({"start": 1, "stop": 0})
+
+        def forbidden_clock() -> int:
+            raise AssertionError("invalid caller reached clock")
+
+        for changes in cases:
+            with self.subTest(changes=changes):
+                budget = self.budget()
+                budget.read_budget.clock_ns = forbidden_clock
+                before = self.state(budget)
+                read_before = vars(budget.read_budget).copy()
+                wire_before = vars(budget.wire_budget).copy()
+                arguments = {"payload": b"x", "start": 0, "stop": 1, "crc": 0, "budget": budget}
+                arguments.update(changes)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    api.verify(**arguments)
+                self.assertEqual(caught.exception.reason_code, "invalid_contract")
+                self.assertEqual(self.state(budget), before)
+                self.assertEqual(vars(budget.read_budget), read_before)
+                self.assertEqual(vars(budget.wire_budget), wire_before)
