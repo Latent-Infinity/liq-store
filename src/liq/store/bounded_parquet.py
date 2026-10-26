@@ -283,6 +283,8 @@ class _CompactWireCursor:
         budget: _CompactWireBudget,
         *,
         kind: str,
+        fetch: Callable[[int, int], bytes] | None = None,
+        page_budget: _PageBudget | None = None,
     ) -> None:
         if (
             type(payload) is not bytes
@@ -291,8 +293,22 @@ class _CompactWireCursor:
             or type(budget) is not _CompactWireBudget
             or type(kind) is not str
             or kind not in ("footer", "page_header")
-            or not 0 <= start <= stop <= len(payload)
         ):
+            raise PinnedReadRefused("invalid_contract")
+        demand = fetch is not None or page_budget is not None
+        if demand:
+            if (
+                kind != "page_header"
+                or not callable(fetch)
+                or type(page_budget) is not _PageBudget
+                or getattr(page_budget, "wire_budget", None) is not budget
+                or type(getattr(page_budget, "read_budget", None)) is not _PinnedReadBudget
+                or payload != b""
+                or start != 0
+                or stop < 0
+            ):
+                raise PinnedReadRefused("invalid_contract")
+        elif not 0 <= start <= stop <= len(payload):
             raise PinnedReadRefused("invalid_contract")
         if len(payload) > budget.limits.max_input_bytes:
             raise PinnedReadRefused("resource_limit")
@@ -304,6 +320,8 @@ class _CompactWireCursor:
         self.kind = kind
         self._structs: list[_CompactWireStruct] = []
         self._pending_bool: bool | None = None
+        self._fetch = fetch
+        self._page_budget = page_budget
 
     def _ensure_available(self, size: int) -> None:
         if size > self.stop - self.position:
@@ -316,10 +334,9 @@ class _CompactWireCursor:
         limits = self.budget.limits
         if (
             size > limits.max_object_bytes - consumed
-            or self.kind == "page_header"
-            and size > limits.max_header_bytes - consumed
-            or binary
-            and size > limits.max_string_bytes
+            or (self.kind == "page_header" and size > limits.max_header_bytes - consumed)
+            or (binary and size > limits.max_string_bytes)
+            or (self._fetch is not None and size > limits.max_input_bytes - self.position)
         ):
             raise PinnedReadRefused("resource_limit")
         self.budget._reserve(
@@ -328,12 +345,38 @@ class _CompactWireCursor:
             string_bytes=size if binary else 0,
             copied_bytes=size if binary and copy_binary else 0,
         )
+        if self._fetch is not None:
+            self._refill_demand(size, copy_bytes=size if binary and copy_binary else 0)
         previous = self.position
         self.position += size
         return previous
 
+    def _refill_demand(self, size: int, *, copy_bytes: int) -> None:
+        pages = self._page_budget
+        fetch = self._fetch
+        if type(pages) is not _PageBudget or fetch is None:
+            raise PinnedReadRefused("invalid_contract")
+        pages.reserve(_PageCharge(allocation_bytes=copy_bytes, work_units=1))
+        required = self.position + size
+        read = pages.read_budget
+        if required - len(self.payload) > read.limits.max_total_read_bytes - read.total_read_bytes:
+            raise PinnedReadRefused("resource_limit")
+        while len(self.payload) < required:
+            start = len(self.payload)
+            length = read.before_read(required - start)
+            replacement = start + length
+            self.budget._reserve(copied_bytes=replacement, work_units=replacement)
+            pages.reserve(_PageCharge(allocation_bytes=length + replacement, work_units=1))
+            segment = fetch(start, length)
+            if type(segment) is not bytes or len(segment) != length:
+                raise PinnedReadRefused("invalid_contract")
+            pages.reserve(_PageCharge(work_units=1))
+            self.payload = self.payload + segment
+        read.check_deadline()
+
     def _unsigned_byte(self) -> int:
-        return self.payload[self._consume(1)]
+        position = self._consume(1)
+        return self.payload[position]
 
     def _varint(self, width: int) -> int:
         value = 0
@@ -438,7 +481,8 @@ class _CompactWireCursor:
         return self._signed_integer(64)
 
     def read_double(self) -> float:
-        return unpack_from("<d", self.payload, self._consume(8))[0]
+        position = self._consume(8)
+        return unpack_from("<d", self.payload, position)[0]
 
     def read_binary(self) -> bytes:
         length = self._varint(31)

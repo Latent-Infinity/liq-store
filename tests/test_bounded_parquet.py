@@ -7526,3 +7526,920 @@ class PageChecksumTests(unittest.TestCase):
                 self.assertEqual(self.state(budget), before)
                 self.assertEqual(vars(budget.read_budget), read_before)
                 self.assertEqual(vars(budget.wire_budget), wire_before)
+
+
+class PageHeaderDemandInputTests(unittest.TestCase):
+    wire_axes = (
+        "total_wire_bytes",
+        "work_units",
+        "total_fields",
+        "total_items",
+        "total_string_bytes",
+        "copied_payload_bytes",
+    )
+
+    def api(self) -> SimpleNamespace:
+        names = (
+            "_CompactWireCursor",
+            "_PageBudget",
+            "_PageCharge",
+            "_PinnedReadBudget",
+            "_admit_page_header",
+        )
+        found = {}
+        for name in names:
+            value = getattr(bounded_parquet, name, None)
+            self.assertTrue(callable(value), f"missing canonical callable {name}")
+            found[name] = value
+        return SimpleNamespace(**found)
+
+    def environment(
+        self,
+        data: bytes,
+        *,
+        wire: dict[str, int] | None = None,
+        page: dict[str, int] | None = None,
+        read: dict[str, int] | None = None,
+        clock: object | None = None,
+    ) -> SimpleNamespace:
+        from dataclasses import replace
+
+        api = self.api()
+        wire_values = {
+            "max_input_bytes": 1 << 30,
+            "max_object_bytes": 1 << 30,
+            "max_header_bytes": 1 << 30,
+            "max_depth": 100,
+            "max_fields_per_struct": 1000,
+            "max_total_fields": 10000,
+            "max_items_per_container": 1 << 30,
+            "max_total_items": 1 << 30,
+            "max_string_bytes": 1 << 30,
+            "max_total_string_bytes": 1 << 30,
+            "max_varint_bytes": 10,
+            "max_total_wire_bytes": 1 << 30,
+            "max_work_units": 1 << 40,
+            "max_copied_payload_bytes": 1 << 40,
+        }
+        wire_values.update(wire or {})
+        wire_budget = CompactWireCursorTests().budget(**wire_values)
+        page_values = dict.fromkeys(("max_" + axis for axis in PageBudgetTests.axes), 1 << 40)
+        page_values.update(page or {})
+        prototype = PageBudgetTests().budget(**page_values)
+        read_values = {"max_source_size_bytes": 1 << 30, "max_total_read_bytes": 1 << 30}
+        read_values.update(read or {})
+        read_budget = api._PinnedReadBudget(
+            replace(prototype.read_budget.limits, **read_values),
+            clock_ns=(lambda: 0) if clock is None else clock,
+        )
+        page_budget = api._PageBudget(
+            read_budget=read_budget, wire_budget=wire_budget, limits=prototype.limits
+        )
+        env = SimpleNamespace(
+            api=api, data=data, wire=wire_budget, page=page_budget, read=read_budget, calls=[]
+        )
+
+        def counted_fetch(offset: int, length: int) -> bytes:
+            env.calls.append((offset, length))
+            self.assertEqual(read_budget.before_read(length), length)
+            segment = data[offset : offset + length]
+            read_budget.record_read(len(segment))
+            return segment
+
+        env.fetch = counted_fetch
+        return env
+
+    def cursor(
+        self,
+        env: SimpleNamespace,
+        *,
+        stop: object = None,
+        **changes: object,
+    ) -> bounded_parquet._CompactWireCursor:
+        arguments = {
+            "payload": b"",
+            "start": 0,
+            "stop": len(env.data) if stop is None else stop,
+            "budget": env.wire,
+            "kind": "page_header",
+            "fetch": env.fetch,
+            "page_budget": env.page,
+        }
+        arguments.update(changes)
+        return env.api._CompactWireCursor(**arguments)
+
+    def assert_metrics(
+        self,
+        env: SimpleNamespace,
+        cursor: bounded_parquet._CompactWireCursor,
+        *,
+        page_work: int = 0,
+        allocation: int = 0,
+        wire_bytes: int = 0,
+        wire_work: int = 0,
+        copied: int = 0,
+        strings: int = 0,
+        read_bytes: int = 0,
+        position: int = 0,
+        payload: bytes = b"",
+    ) -> None:
+        expected_page = dict.fromkeys(PageBudgetTests.axes, 0)
+        expected_page.update(work_units=page_work, allocation_bytes=allocation)
+        self.assertEqual(
+            {axis: getattr(env.page, axis) for axis in PageBudgetTests.axes}, expected_page
+        )
+        self.assertEqual(
+            {axis: getattr(env.wire, axis) for axis in self.wire_axes},
+            {
+                "total_wire_bytes": wire_bytes,
+                "work_units": wire_work,
+                "total_fields": 0,
+                "total_items": 0,
+                "total_string_bytes": strings,
+                "copied_payload_bytes": copied,
+            },
+        )
+        self.assertEqual(env.read.source_opens, 0)
+        self.assertEqual(env.read.total_read_bytes, read_bytes)
+        self.assertEqual(cursor.position, position)
+        self.assertEqual(cursor.payload, payload)
+
+    def test_constructor_exposes_optional_keyword_only_pair(self) -> None:
+        import inspect
+
+        parameters = inspect.signature(self.api()._CompactWireCursor).parameters
+        for name in ("fetch", "page_budget"):
+            self.assertIn(name, parameters)
+            self.assertEqual(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertIsNone(parameters[name].default)
+
+    def test_invalid_input_mode_contract_precedes_clocks_callbacks_and_counters(self) -> None:
+        class DerivedBytes(bytes):
+            pass
+
+        class DerivedInt(int):
+            pass
+
+        class DerivedPageBudget(bounded_parquet._PageBudget):
+            pass
+
+        class DerivedKind(str):
+            pass
+
+        class DerivedWireBudget(bounded_parquet._CompactWireBudget):
+            pass
+
+        def forbidden_clock() -> int:
+            raise AssertionError("invalid constructor reached clock")
+
+        cases = (
+            {"fetch": None},
+            {"page_budget": None},
+            {"fetch": 1},
+            {"page_budget": object()},
+            {"page_budget": object.__new__(DerivedPageBudget)},
+            {"kind": "footer"},
+            {"kind": DerivedKind("page_header")},
+            {"budget": None},
+            {"budget": object.__new__(DerivedWireBudget)},
+            {"payload": b"x"},
+            {"payload": bytearray()},
+            {"payload": DerivedBytes()},
+            {"start": 1},
+            {"start": False},
+            {"start": 0.0},
+            {"start": DerivedInt(0)},
+            {"stop": -1},
+            {"stop": True},
+            {"stop": 1.0},
+            {"stop": DerivedInt(1)},
+        )
+        for changes in cases:
+            with self.subTest(changes=changes):
+                env = self.environment(b"x", clock=forbidden_clock)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    self.cursor(env, **changes)
+                self.assertEqual(caught.exception.reason_code, "invalid_contract")
+                self.assertEqual(env.calls, [])
+                self.assertEqual(
+                    PageBudgetTests().state(env.page), (0,) * len(PageBudgetTests.axes)
+                )
+                self.assertEqual(
+                    tuple(getattr(env.wire, axis) for axis in self.wire_axes), (0,) * 6
+                )
+                self.assertEqual(env.read.total_read_bytes, 0)
+
+    def test_mismatched_wire_or_invalid_read_budget_precedes_any_clock(self) -> None:
+        def forbidden_clock() -> int:
+            raise AssertionError("invalid budget binding reached clock")
+
+        class DerivedReadBudget(bounded_parquet._PinnedReadBudget):
+            pass
+
+        for invalid in ("wire", "read", "read_subclass"):
+            with self.subTest(invalid=invalid):
+                env = self.environment(b"x", clock=forbidden_clock)
+                if invalid == "wire":
+                    changes = {"budget": CompactWireCursorTests().budget()}
+                else:
+                    env.page.read_budget = (
+                        None if invalid == "read" else object.__new__(DerivedReadBudget)
+                    )
+                    changes = {}
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    self.cursor(env, **changes)
+                self.assertEqual(caught.exception.reason_code, "invalid_contract")
+                self.assertEqual(env.calls, [])
+                self.assertEqual(
+                    PageBudgetTests().state(env.page), (0,) * len(PageBudgetTests.axes)
+                )
+                self.assertEqual(env.read.total_read_bytes, 0)
+
+    def test_omitted_and_explicit_absent_options_preserve_resident_path_without_clock(self) -> None:
+        def forbidden_clock() -> int:
+            raise AssertionError("resident cursor reached page clock")
+
+        for options in ({}, {"fetch": None, "page_budget": None}):
+            with self.subTest(options=options):
+                env = self.environment(b"\xff", clock=forbidden_clock)
+                cursor = env.api._CompactWireCursor(
+                    b"\xff", 0, 1, env.wire, kind="page_header", **options
+                )
+                self.assertEqual(cursor.read_byte(), -1)
+                self.assertEqual(env.calls, [])
+                self.assert_metrics(
+                    env, cursor, wire_bytes=1, wire_work=1, position=1, payload=b"\xff"
+                )
+
+    def test_first_incremental_byte_uses_the_refreshed_payload(self) -> None:
+        env = self.environment(b"\xff")
+        cursor = self.cursor(env)
+        self.assertEqual(cursor.read_byte(), -1)
+        self.assertEqual(env.calls, [(0, 1)])
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=3,
+            allocation=2,
+            wire_bytes=1,
+            wire_work=2,
+            copied=1,
+            read_bytes=1,
+            position=1,
+            payload=b"\xff",
+        )
+
+    def test_double_uses_the_refreshed_eight_byte_payload(self) -> None:
+        double = b"\x00\x00\x00\x00\x00\x00\xf0\x3f"
+        for prefix in (b"", b"\x7f"):
+            with self.subTest(prefix=prefix):
+                data = prefix + double
+                env = self.environment(data)
+                cursor = self.cursor(env)
+                if prefix:
+                    self.assertEqual(cursor.read_byte(), 127)
+                self.assertEqual(cursor.read_double(), 1.0)
+                if prefix:
+                    self.assertEqual(env.calls, [(0, 1), (1, 8)])
+                    self.assert_metrics(
+                        env,
+                        cursor,
+                        page_work=6,
+                        allocation=19,
+                        wire_bytes=9,
+                        wire_work=19,
+                        copied=10,
+                        read_bytes=9,
+                        position=9,
+                        payload=data,
+                    )
+                else:
+                    self.assertEqual(env.calls, [(0, 8)])
+                    self.assert_metrics(
+                        env,
+                        cursor,
+                        page_work=3,
+                        allocation=16,
+                        wire_bytes=8,
+                        wire_work=16,
+                        copied=8,
+                        read_bytes=8,
+                        position=8,
+                        payload=data,
+                    )
+
+    def test_binary_span_offsets_and_prior_prefix_survive_later_refill(self) -> None:
+        data = b"\x08ABCDEFGH\x7f"
+        env = self.environment(data)
+        cursor = self.cursor(env)
+        span = cursor.read_binary_span()
+        self.assertEqual(span, (1, 9))
+        self.assertEqual(cursor.payload[span[0] : span[1]], b"ABCDEFGH")
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=6,
+            allocation=19,
+            wire_bytes=9,
+            wire_work=19,
+            copied=10,
+            strings=8,
+            read_bytes=9,
+            position=9,
+            payload=data[:9],
+        )
+        self.assertEqual(cursor.read_byte(), 127)
+        self.assertEqual(cursor.payload[span[0] : span[1]], b"ABCDEFGH")
+        self.assertEqual(env.calls, [(0, 1), (1, 8), (9, 1)])
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=9,
+            allocation=30,
+            wire_bytes=10,
+            wire_work=30,
+            copied=20,
+            strings=8,
+            read_bytes=10,
+            position=10,
+            payload=data,
+        )
+
+    def test_binary_copy_remains_stable_and_is_charged_separately(self) -> None:
+        data = b"\x08ABCDEFGH\x7f"
+        env = self.environment(data)
+        cursor = self.cursor(env)
+        copied_value = cursor.read_binary()
+        self.assertEqual(copied_value, b"ABCDEFGH")
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=6,
+            allocation=27,
+            wire_bytes=9,
+            wire_work=19,
+            copied=18,
+            strings=8,
+            read_bytes=9,
+            position=9,
+            payload=data[:9],
+        )
+        self.assertEqual(cursor.read_byte(), 127)
+        self.assertEqual(copied_value, b"ABCDEFGH")
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=9,
+            allocation=38,
+            wire_bytes=10,
+            wire_work=30,
+            copied=28,
+            strings=8,
+            read_bytes=10,
+            position=10,
+            payload=data,
+        )
+
+    def test_zero_length_binary_consume_has_entry_work_but_no_empty_callback(self) -> None:
+        for copying in (False, True):
+            with self.subTest(copying=copying):
+                env = self.environment(b"\x00")
+                cursor = self.cursor(env)
+                value = cursor.read_binary() if copying else cursor.read_binary_span()
+                self.assertEqual(value, b"" if copying else (1, 1))
+                self.assertEqual(env.calls, [(0, 1)])
+                self.assert_metrics(
+                    env,
+                    cursor,
+                    page_work=4,
+                    allocation=2,
+                    wire_bytes=1,
+                    wire_work=2,
+                    copied=1,
+                    read_bytes=1,
+                    position=1,
+                    payload=b"\x00",
+                )
+
+    def test_large_binary_span_uses_existing_read_segments_and_literal_accounting(self) -> None:
+        data = b"\x81\x80\x40" + b"Z" * 1048577
+        env = self.environment(data)
+        cursor = self.cursor(env)
+        self.assertEqual(cursor.read_binary_span(), (3, 1048580))
+        self.assertEqual(env.calls, [(0, 1), (1, 1), (2, 1), (3, 1048576), (1048579, 1)])
+        self.assertEqual(len(cursor.payload), 1048580)
+        self.assertEqual(cursor.payload[:3], b"\x81\x80\x40")
+        self.assertEqual(cursor.payload[-1:], b"Z")
+        self.assertEqual(cursor.position, 1048580)
+        self.assertEqual(env.page.work_units, 14)
+        self.assertEqual(env.page.allocation_bytes, 3145745)
+        self.assertEqual(env.wire.total_wire_bytes, 1048580)
+        self.assertEqual(env.wire.work_units, 3145745)
+        self.assertEqual(env.wire.copied_payload_bytes, 2097165)
+        self.assertEqual(env.wire.total_string_bytes, 1048577)
+        self.assertEqual(env.read.total_read_bytes, 1048580)
+        self.assertEqual(
+            {
+                axis: getattr(env.page, axis)
+                for axis in PageBudgetTests.axes
+                if axis not in ("work_units", "allocation_bytes")
+            },
+            dict.fromkeys(
+                (
+                    axis
+                    for axis in PageBudgetTests.axes
+                    if axis not in ("work_units", "allocation_bytes")
+                ),
+                0,
+            ),
+        )
+
+    def test_root_stop_does_not_acquire_following_serialized_body(self) -> None:
+        header = b"\x15\x00\x15\x02\x15\x02\x2c\x15\x00\x15\x00\x15\x06\x15\x06\x00\x00"
+        env = self.environment(header + b"\xff")
+        cursor = self.cursor(env)
+        admission = env.api._admit_page_header(cursor, chunk_remaining_bytes=18, budget=env.page)
+        self.assertEqual(env.calls, [(offset, 1) for offset in range(17)])
+        self.assertEqual(cursor.payload, header)
+        self.assertEqual(cursor.position, 17)
+        self.assertEqual(
+            (
+                admission.header_start,
+                admission.header_end,
+                admission.body_start,
+                admission.body_end,
+            ),
+            (0, 17, 17, 18),
+        )
+        self.assertEqual((admission.compressed_page_size, admission.uncompressed_page_size), (1, 1))
+        self.assertEqual(env.read.total_read_bytes, 17)
+        self.assertEqual(
+            (env.page.pages, env.page.compressed_bytes, env.page.uncompressed_bytes), (1, 1, 1)
+        )
+        self.assertFalse(admission.decode_eligible)
+
+    def test_logical_chunk_bound_precedes_every_reservation_and_callback(self) -> None:
+        for data, stop, operation in ((b"", 0, "read_byte"), (b"12345678", 7, "read_double")):
+            with self.subTest(stop=stop):
+                env = self.environment(data)
+                cursor = self.cursor(env, stop=stop)
+                with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+                    getattr(cursor, operation)()
+                self.assertEqual(caught.exception.reason_code, "truncated_wire")
+                self.assertEqual(env.calls, [])
+                self.assert_metrics(env, cursor)
+
+    def test_logical_extent_can_exceed_small_resident_header_input_allowance(self) -> None:
+        env = self.environment(b"\x7f" + b"ignored", wire={"max_input_bytes": 1})
+        cursor = self.cursor(env)
+        self.assertEqual(cursor.read_byte(), 127)
+        self.assertEqual(env.calls, [(0, 1)])
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=3,
+            allocation=2,
+            wire_bytes=1,
+            wire_work=2,
+            copied=1,
+            read_bytes=1,
+            position=1,
+            payload=b"\x7f",
+        )
+        with self.assertRaises(PinnedReadRefused) as caught:
+            cursor.read_byte()
+        self.assertEqual(caught.exception.reason_code, "resource_limit")
+        self.assertEqual(env.calls, [(0, 1)])
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=3,
+            allocation=2,
+            wire_bytes=1,
+            wire_work=2,
+            copied=1,
+            read_bytes=1,
+            position=1,
+            payload=b"\x7f",
+        )
+
+    def test_input_object_and_header_limits_refuse_before_wire_and_page_charges(self) -> None:
+        for axis in ("max_input_bytes", "max_object_bytes", "max_header_bytes"):
+            with self.subTest(axis=axis):
+                env = self.environment(b"12345678", wire={axis: 7})
+                cursor = self.cursor(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    cursor.read_double()
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                self.assertEqual(env.calls, [])
+                self.assert_metrics(env, cursor)
+
+    def test_grammar_wire_reservation_failure_leaves_page_and_callback_untouched(self) -> None:
+        for axis in ("max_total_wire_bytes", "max_work_units"):
+            with self.subTest(axis=axis):
+                env = self.environment(b"12345678", wire={axis: 7})
+                cursor = self.cursor(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    cursor.read_double()
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                self.assertEqual(env.calls, [])
+                self.assert_metrics(env, cursor)
+
+    def test_prefix_copy_wire_refusal_retains_only_grammar_and_page_entry(self) -> None:
+        for changes in ({"max_copied_payload_bytes": 7}, {"max_work_units": 15}):
+            with self.subTest(changes=changes):
+                env = self.environment(b"12345678", wire=changes)
+                cursor = self.cursor(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    cursor.read_double()
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                self.assertEqual(env.calls, [])
+                self.assert_metrics(env, cursor, page_work=1, wire_bytes=8, wire_work=8)
+
+    def test_page_allocation_refusal_keeps_prepaid_wire_copy_without_fetch(self) -> None:
+        env = self.environment(b"12345678", page={"max_allocation_bytes": 15})
+        cursor = self.cursor(env)
+        with self.assertRaises(PinnedReadRefused) as caught:
+            cursor.read_double()
+        self.assertEqual(caught.exception.reason_code, "resource_limit")
+        self.assertEqual(env.calls, [])
+        self.assert_metrics(env, cursor, page_work=1, wire_bytes=8, wire_work=16, copied=8)
+
+    def test_page_entry_refusal_retains_grammar_without_refill_reservations(self) -> None:
+        env = self.environment(b"12345678", page={"max_work_units": 1})
+        env.page.reserve(env.api._PageCharge(work_units=1))
+        cursor = self.cursor(env)
+        with self.assertRaises(PinnedReadRefused) as caught:
+            cursor.read_double()
+        self.assertEqual(caught.exception.reason_code, "resource_limit")
+        self.assertEqual(env.calls, [])
+        self.assert_metrics(env, cursor, page_work=1, wire_bytes=8, wire_work=8)
+
+    def test_prefetch_work_refusal_is_atomic_with_its_allocation(self) -> None:
+        env = self.environment(b"12345678", page={"max_work_units": 1})
+        cursor = self.cursor(env)
+        with self.assertRaises(PinnedReadRefused) as caught:
+            cursor.read_double()
+        self.assertEqual(caught.exception.reason_code, "resource_limit")
+        self.assertEqual(env.calls, [])
+        self.assert_metrics(env, cursor, page_work=1, wire_bytes=8, wire_work=16, copied=8)
+
+    def test_precopy_work_refusal_retains_read_but_not_new_prefix_or_position(self) -> None:
+        env = self.environment(b"12345678", page={"max_work_units": 2})
+        cursor = self.cursor(env)
+        with self.assertRaises(PinnedReadRefused) as caught:
+            cursor.read_double()
+        self.assertEqual(caught.exception.reason_code, "resource_limit")
+        self.assertEqual(env.calls, [(0, 8)])
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=2,
+            allocation=16,
+            wire_bytes=8,
+            wire_work=16,
+            copied=8,
+            read_bytes=8,
+        )
+
+    def test_whole_missing_read_allowance_is_checked_before_any_partial_fetch(self) -> None:
+        env = self.environment(b"12345678", read={"max_total_read_bytes": 7})
+        cursor = self.cursor(env)
+        with self.assertRaises(PinnedReadRefused) as caught:
+            cursor.read_double()
+        self.assertEqual(caught.exception.reason_code, "resource_limit")
+        self.assertEqual(env.calls, [])
+        self.assert_metrics(env, cursor, page_work=1, wire_bytes=8, wire_work=8)
+
+    def test_binary_string_limits_keep_only_the_admitted_length_prefix(self) -> None:
+        for axis in ("max_string_bytes", "max_total_string_bytes"):
+            with self.subTest(axis=axis):
+                env = self.environment(b"\x08ABCDEFGH", wire={axis: 7})
+                cursor = self.cursor(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    cursor.read_binary_span()
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                self.assertEqual(env.calls, [(0, 1)])
+                self.assert_metrics(
+                    env,
+                    cursor,
+                    page_work=3,
+                    allocation=2,
+                    wire_bytes=1,
+                    wire_work=2,
+                    copied=1,
+                    read_bytes=1,
+                    position=1,
+                    payload=b"\x08",
+                )
+
+    def test_binary_copy_reservations_fail_before_binary_refill(self) -> None:
+        cases = (
+            ({"max_copied_payload_bytes": 8}, {}, 3, 2, 2, 1),
+            ({}, {"max_allocation_bytes": 9}, 3, 2, 10, 9),
+        )
+        for wire, page, page_work, allocation, wire_work, copied in cases:
+            with self.subTest(wire=wire, page=page):
+                env = self.environment(b"\x08ABCDEFGH", wire=wire, page=page)
+                cursor = self.cursor(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    cursor.read_binary()
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                self.assertEqual(env.calls, [(0, 1)])
+                self.assert_metrics(
+                    env,
+                    cursor,
+                    page_work=page_work,
+                    allocation=allocation,
+                    wire_bytes=1 if wire else 9,
+                    wire_work=wire_work,
+                    copied=copied,
+                    strings=0 if wire else 8,
+                    read_bytes=1,
+                    position=1,
+                    payload=b"\x08",
+                )
+
+    def test_later_binary_failures_preserve_exact_cross_ledger_prefixes(self) -> None:
+        cases = (
+            ({"max_copied_payload_bytes": 17}, {}, {}, 4, 10, 10, 9, 1, [(0, 1)]),
+            ({}, {"max_allocation_bytes": 26}, {}, 4, 10, 19, 18, 1, [(0, 1)]),
+            ({}, {"max_work_units": 5}, {}, 5, 27, 19, 18, 9, [(0, 1), (1, 8)]),
+            ({}, {}, {"max_total_read_bytes": 8}, 4, 10, 10, 9, 1, [(0, 1)]),
+        )
+        for wire, page, read, page_work, allocation, wire_work, copied, read_bytes, calls in cases:
+            with self.subTest(wire=wire, page=page, read=read):
+                env = self.environment(b"\x08ABCDEFGH", wire=wire, page=page, read=read)
+                cursor = self.cursor(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    cursor.read_binary()
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                self.assertEqual(env.calls, calls)
+                self.assert_metrics(
+                    env,
+                    cursor,
+                    page_work=page_work,
+                    allocation=allocation,
+                    wire_bytes=9,
+                    wire_work=wire_work,
+                    copied=copied,
+                    strings=8,
+                    read_bytes=read_bytes,
+                    position=1,
+                    payload=b"\x08",
+                )
+
+    def test_each_single_byte_deadline_checkpoint_has_a_literal_retained_prefix(self) -> None:
+        expected = (
+            (0, 0, 0, 1, 0, [], b""),
+            (1, 0, 0, 1, 0, [], b""),
+            (1, 0, 0, 2, 1, [], b""),
+            (2, 2, 0, 2, 1, [(0, 1)], b""),
+            (2, 2, 1, 2, 1, [(0, 1)], b""),
+            (2, 2, 1, 2, 1, [(0, 1)], b""),
+            (3, 2, 1, 2, 1, [(0, 1)], b"x"),
+        )
+        for fail_at, (
+            work,
+            allocation,
+            read_bytes,
+            wire_work,
+            copied,
+            requests,
+            payload,
+        ) in enumerate(expected, 1):
+            with self.subTest(fail_at=fail_at):
+                calls = [0]
+
+                def clock(failure: int = fail_at, count: list[int] = calls) -> int:
+                    count[0] += 1
+                    return 10 if count[0] == failure else 0
+
+                env = self.environment(b"x", clock=clock)
+                cursor = self.cursor(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    cursor.read_byte()
+                self.assertEqual(caught.exception.reason_code, "deadline_exceeded")
+                self.assertEqual(calls[0], fail_at)
+                self.assertEqual(env.calls, requests)
+                self.assert_metrics(
+                    env,
+                    cursor,
+                    page_work=work,
+                    allocation=allocation,
+                    wire_bytes=1,
+                    wire_work=wire_work,
+                    copied=copied,
+                    read_bytes=read_bytes,
+                    payload=payload,
+                )
+
+    def test_callback_exceptions_propagate_unchanged_without_retry_or_refund(self) -> None:
+        for partial in (0, 2):
+            with self.subTest(partial=partial):
+                env = self.environment(b"12345678")
+                sentinel = RuntimeError("neutral supplier exception")
+
+                def raising_fetch(
+                    offset: int,
+                    length: int,
+                    env: SimpleNamespace = env,
+                    partial: int = partial,
+                    sentinel: RuntimeError = sentinel,
+                ) -> bytes:
+                    env.calls.append((offset, length))
+                    self.assertEqual(env.read.before_read(length), length)
+                    if partial:
+                        env.read.record_read(partial)
+                    raise sentinel
+
+                env.fetch = raising_fetch
+                cursor = self.cursor(env)
+                with self.assertRaises(RuntimeError) as caught:
+                    cursor.read_double()
+                self.assertIs(caught.exception, sentinel)
+                self.assertEqual(env.calls, [(0, 8)])
+                self.assert_metrics(
+                    env,
+                    cursor,
+                    page_work=2,
+                    allocation=16,
+                    wire_bytes=8,
+                    wire_work=16,
+                    copied=8,
+                    read_bytes=partial,
+                )
+
+    def test_wrong_callback_type_or_length_is_invalid_contract_without_retry(self) -> None:
+        for returned in (None, bytearray(b"12345678"), b"1234567", b"123456789"):
+            with self.subTest(
+                return_type=type(returned).__name__,
+                returned_length=None if returned is None else len(returned),
+            ):
+                env = self.environment(b"12345678")
+
+                def broken_fetch(
+                    offset: int,
+                    length: int,
+                    env: SimpleNamespace = env,
+                    returned: object = returned,
+                ) -> object:
+                    env.calls.append((offset, length))
+                    self.assertEqual(env.read.before_read(length), length)
+                    if isinstance(returned, (bytes, bytearray)):
+                        env.read.record_read(len(returned))
+                    return returned
+
+                env.fetch = broken_fetch
+                cursor = self.cursor(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    cursor.read_double()
+                self.assertEqual(caught.exception.reason_code, "invalid_contract")
+                self.assertEqual(env.calls, [(0, 8)])
+                self.assert_metrics(
+                    env,
+                    cursor,
+                    page_work=2,
+                    allocation=16,
+                    wire_bytes=8,
+                    wire_work=16,
+                    copied=8,
+                    read_bytes=0 if returned is None else len(returned),
+                )
+
+    def test_all_exact_double_allowances_are_sufficient_without_hidden_charge(self) -> None:
+        data = b"\x00\x00\x00\x00\x00\x00\xf0\x3f"
+        env = self.environment(
+            data,
+            wire={
+                "max_input_bytes": 8,
+                "max_object_bytes": 8,
+                "max_header_bytes": 8,
+                "max_total_wire_bytes": 8,
+                "max_work_units": 16,
+                "max_copied_payload_bytes": 8,
+            },
+            page={"max_work_units": 3, "max_allocation_bytes": 16},
+            read={"max_total_read_bytes": 8},
+        )
+        cursor = self.cursor(env)
+        self.assertEqual(cursor.read_double(), 1.0)
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=3,
+            allocation=16,
+            wire_bytes=8,
+            wire_work=16,
+            copied=8,
+            read_bytes=8,
+            position=8,
+            payload=data,
+        )
+
+    def test_binary_copy_exact_string_copy_allocation_and_read_allowances_are_sufficient(
+        self,
+    ) -> None:
+        data = b"\x08ABCDEFGH"
+        env = self.environment(
+            data,
+            wire={
+                "max_input_bytes": 9,
+                "max_object_bytes": 9,
+                "max_header_bytes": 9,
+                "max_string_bytes": 8,
+                "max_total_string_bytes": 8,
+                "max_total_wire_bytes": 9,
+                "max_work_units": 19,
+                "max_copied_payload_bytes": 18,
+            },
+            page={"max_work_units": 6, "max_allocation_bytes": 27},
+            read={"max_total_read_bytes": 9},
+        )
+        cursor = self.cursor(env)
+        self.assertEqual(cursor.read_binary(), b"ABCDEFGH")
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=6,
+            allocation=27,
+            wire_bytes=9,
+            wire_work=19,
+            copied=18,
+            strings=8,
+            read_bytes=9,
+            position=9,
+            payload=data,
+        )
+
+    def test_repeated_consumes_use_cumulative_prefix_copy_budget(self) -> None:
+        env = self.environment(
+            b"xy",
+            wire={"max_total_wire_bytes": 2, "max_work_units": 5, "max_copied_payload_bytes": 3},
+            page={"max_work_units": 6, "max_allocation_bytes": 5},
+            read={"max_total_read_bytes": 2},
+        )
+        cursor = self.cursor(env)
+        self.assertEqual((cursor.read_byte(), cursor.read_byte()), (120, 121))
+        self.assertEqual(env.calls, [(0, 1), (1, 1)])
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=6,
+            allocation=5,
+            wire_bytes=2,
+            wire_work=5,
+            copied=3,
+            read_bytes=2,
+            position=2,
+            payload=b"xy",
+        )
+        with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+            cursor.read_byte()
+        self.assertEqual(caught.exception.reason_code, "truncated_wire")
+        self.assertEqual(env.calls, [(0, 1), (1, 1)])
+        self.assert_metrics(
+            env,
+            cursor,
+            page_work=6,
+            allocation=5,
+            wire_bytes=2,
+            wire_work=5,
+            copied=3,
+            read_bytes=2,
+            position=2,
+            payload=b"xy",
+        )
+
+    def test_later_segment_allocation_refusal_retains_loaded_prefix_without_advancing_demand(
+        self,
+    ) -> None:
+        data = b"\x81\x80\x40" + b"Z" * 1048577
+        env = self.environment(data, page={"max_allocation_bytes": 3145744})
+        cursor = self.cursor(env)
+        with self.assertRaises(PinnedReadRefused) as caught:
+            cursor.read_binary_span()
+        self.assertEqual(caught.exception.reason_code, "resource_limit")
+        self.assertEqual(env.calls, [(0, 1), (1, 1), (2, 1), (3, 1048576)])
+        self.assertEqual(cursor.position, 3)
+        self.assertEqual(len(cursor.payload), 1048579)
+        self.assertEqual(cursor.payload[:3], b"\x81\x80\x40")
+        self.assertEqual(cursor.payload[-1:], b"Z")
+        expected_page = dict.fromkeys(PageBudgetTests.axes, 0)
+        expected_page.update(work_units=12, allocation_bytes=2097164)
+        self.assertEqual(
+            {axis: getattr(env.page, axis) for axis in PageBudgetTests.axes}, expected_page
+        )
+        self.assertEqual(
+            {axis: getattr(env.wire, axis) for axis in self.wire_axes},
+            {
+                "total_wire_bytes": 1048580,
+                "work_units": 3145745,
+                "total_fields": 0,
+                "total_items": 0,
+                "total_string_bytes": 1048577,
+                "copied_payload_bytes": 2097165,
+            },
+        )
+        self.assertEqual(env.read.source_opens, 0)
+        self.assertEqual(env.read.total_read_bytes, 1048579)
