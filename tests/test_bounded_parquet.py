@@ -8443,3 +8443,1400 @@ class PageHeaderDemandInputTests(unittest.TestCase):
         )
         self.assertEqual(env.read.source_opens, 0)
         self.assertEqual(env.read.total_read_bytes, 1048579)
+
+
+class LiveSourceHeaderTests(unittest.TestCase):
+    metadata_flags = (
+        "root_repetition_present",
+        "row_group_ordinal_interpretation_unresolved",
+        "unresolved_logical_compatibility",
+        "arrow_schema_metadata_present",
+        "arrow_extension_metadata_present",
+        "opaque_metadata_present",
+        "page_profile_unverified",
+        "native_conversion_unproved",
+        "source_binding_unproved",
+        "utc_value_gate_unproved",
+    )
+    blocked_flags = (
+        "primitive_child_count_present",
+        "unresolved_schema_tree",
+        "ambiguous_projection_name",
+        "external_column_reference",
+        "plaintext_column_metadata_absent",
+        "encrypted_column_metadata_present",
+        "column_encryption_present",
+        "footer_encryption_present",
+        "footer_signing_metadata_present",
+        "unbounded_bloom_extent",
+        "legacy_index_page_reference",
+        "unrecognized_file_version",
+        "unresolved_extent_interpretation",
+    )
+
+    class Ranges(dict[tuple[int, int], bytes]):
+        def __init__(self, payload: bytes) -> None:
+            super().__init__()
+            self.payload = payload
+
+        def __missing__(self, key: tuple[int, int]) -> bytes:
+            offset, length = key
+            return self.payload[offset : offset + length]
+
+    def api(self):
+        names = (
+            "_LiveFooterAcquisition",
+            "_OwnedPageHeaderAdmission",
+            "_read_footer_from_source",
+            "_footer_envelope_from_acquisition",
+            "_admit_owned_initial_page_header",
+        )
+        values = {name: getattr(bounded_parquet, name, None) for name in names}
+        for name, value in values.items():
+            self.assertTrue(callable(value), f"missing owner interface {name}")
+        return SimpleNamespace(**values)
+
+    def io_for(self, payload: bytes) -> _EnvelopeLoggedIO:
+        io = _EnvelopeLoggedIO()
+        io.payload = payload
+        io.digest = hashlib.sha256(payload).hexdigest()
+        io.before = io.metadata()
+        io.after = io.metadata()
+        io.located = io.metadata()
+        io.responses = self.Ranges(payload)
+        return io
+
+    def budgets(self, io, *, read=None, page=None):
+        read_budget = FooterEnvelopeTests().budget(io, **(read or {}))
+        wire = FooterGrammarTests().wire_budget(
+            max_copied_payload_bytes=65536, max_header_bytes=512
+        )
+        footer = bounded_parquet._FooterBudget(
+            wire_budget=wire, limits=bounded_parquet._FooterLimits(**_GRAMMAR_LIMITS)
+        )
+        limits = dict.fromkeys(("max_" + axis for axis in PageBudgetTests.axes), 1 << 24)
+        limits.update(page or {})
+        pages = bounded_parquet._PageBudget(
+            read_budget=read_budget,
+            wire_budget=wire,
+            limits=bounded_parquet._PageLimits(**limits),
+        )
+        return SimpleNamespace(read=read_budget, wire=wire, footer=footer, page=pages)
+
+    def fixture(self, flags=(), *, other_flags=(), dictionary=False, kind=None):
+        f = FooterProfileTests()
+        header_api = PageHeaderAdmissionTests()
+        actual_kind = 2 if dictionary else 0
+        if kind is not None:
+            actual_kind = kind
+        detail = (
+            ((1, "i32", _grammar_integer(2)), (2, "i32", _grammar_integer(0)))
+            if actual_kind == 2
+            else tuple((n, "i32", _grammar_integer(v)) for n, v in ((1, 3), (2, 0), (3, 3), (4, 3)))
+        )
+        header = header_api.wire(actual_kind, detail=detail, compressed=7, uncompressed=7)
+        data_header = header_api.wire(
+            0,
+            detail=tuple(
+                (n, "i32", _grammar_integer(v)) for n, v in ((1, 3), (2, 0), (3, 3), (4, 3))
+            ),
+            compressed=7,
+            uncompressed=7,
+        )
+        segment = header + b"\x00" * 7
+        if dictionary:
+            segment += data_header + b"\x00" * 7
+        root_extra = []
+        group_extra = []
+        version = 1
+        columns = [(b"n", tuple(flags))]
+        if other_flags:
+            columns.append((b"m", tuple(other_flags)))
+        if "ambiguous_projection_name" in flags:
+            columns.append((b"n", ()))
+        leaves = []
+        chunks = []
+        body = b"PAR1" + b"\x00" * 60
+        for name, column_flags in columns:
+            origin = len(body)
+            node_changes = {}
+            meta_extra = []
+            chunk_extra = []
+            external = None
+            data_origin = origin + len(header) + 7 if dictionary else origin
+            missing_metadata = False
+            for flag in column_flags:
+                if flag == "root_repetition_present":
+                    pass
+                elif flag in ("primitive_child_count_present", "unresolved_schema_tree"):
+                    node_changes["children"] = 0
+                elif flag == "row_group_ordinal_interpretation_unresolved":
+                    group_extra.append((7, "i16", _grammar_integer(-1)))
+                elif flag == "unresolved_logical_compatibility":
+                    node_changes.update(logical=f.logical(11), converted=9)
+                elif flag == "external_column_reference":
+                    external = b"neutral-external.parquet"
+                elif flag == "plaintext_column_metadata_absent":
+                    missing_metadata = True
+                elif flag == "encrypted_column_metadata_present":
+                    chunk_extra.append((9, "binary", f.binary(b"opaque-marker")))
+                elif flag == "column_encryption_present":
+                    chunk_extra.append((8, "struct", f.structure(((1, "struct", b"\x00"),))))
+                elif flag == "footer_encryption_present":
+                    root_extra.append((8, "struct", f.structure(((1, "struct", b"\x00"),))))
+                elif flag == "footer_signing_metadata_present":
+                    root_extra.append((9, "binary", f.binary(b"opaque-marker")))
+                elif flag in (
+                    "arrow_schema_metadata_present",
+                    "arrow_extension_metadata_present",
+                    "opaque_metadata_present",
+                ):
+                    key = {
+                        "arrow_schema_metadata_present": b"ARROW:schema",
+                        "arrow_extension_metadata_present": b"ARROW:extension:name",
+                        "opaque_metadata_present": b"neutral-key",
+                    }[flag]
+                    entry = f.kv(key, b"opaque-marker")
+                    root_extra.append((5, "list:struct", _grammar_list("struct", (entry,))))
+                elif flag == "unbounded_bloom_extent":
+                    meta_extra.append((14, "i64", _grammar_integer(origin)))
+                elif flag == "legacy_index_page_reference":
+                    meta_extra.append((10, "i64", _grammar_integer(origin)))
+                elif flag == "unrecognized_file_version":
+                    version = 3
+                elif flag == "unresolved_extent_interpretation":
+                    meta_extra.append((11, "i64", _grammar_integer(0)))
+                elif flag not in (
+                    "unresolved_schema_tree",
+                    "ambiguous_projection_name",
+                    *self.metadata_flags,
+                ):
+                    raise AssertionError(f"undeclared neutral flag witness {flag}")
+            if dictionary:
+                meta_extra.append((11, "i64", _grammar_integer(origin)))
+            leaves.append(f.node(name, **node_changes))
+            metadata = (
+                None
+                if missing_metadata
+                else f.meta(
+                    path=(name,),
+                    values=3,
+                    data=data_origin,
+                    compressed=len(segment),
+                    uncompressed=len(segment),
+                    encodings=(0, 3),
+                    extra=tuple(meta_extra),
+                )
+            )
+            chunks.append(f.chunk(metadata, external=external, extra=tuple(chunk_extra)))
+            body += segment
+        count = len(leaves)
+        root = (
+            f.node(b"root", physical=None, repetition=0, children=count)
+            if "root_repetition_present" in flags
+            else f.root(count)
+        )
+        footer = f.payload(
+            (root, *leaves),
+            (
+                f.group(
+                    tuple(chunks), rows=3, size=len(segment) * len(chunks), extra=tuple(group_extra)
+                ),
+            ),
+            rows=3,
+            version=version,
+            extra=tuple(root_extra),
+        )
+        payload = body + footer + len(footer).to_bytes(4, "little") + b"PAR1"
+        return SimpleNamespace(
+            payload=payload,
+            footer=footer,
+            header=header,
+            origin=64,
+            body_size=7,
+            footer_start=len(body),
+            dictionary=dictionary,
+            expected_flags=tuple(flags) + tuple(other_flags),
+        )
+
+    def acquire(self, io, source, ledgers, before, *, integrated=True):
+        api = self.api()
+        result = api._read_footer_from_source(
+            source,
+            max_footer_bytes=2 * 1024 * 1024,
+            max_retained_payload_bytes=2 * 1024 * 1024,
+            budget=ledgers.read,
+            receipt_before=before,
+            page_budget=ledgers.page if integrated else None,
+        )
+        self.assertIsInstance(result, api._LiveFooterAcquisition)
+        return result
+
+    def composition(self, fixture=None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def opened():
+            case = self.fixture() if fixture is None else fixture
+            _, witness_profile = FooterProfileTests().complete(case.footer)
+            for flag in case.expected_flags:
+                self.assertIn(
+                    flag, witness_profile.flags, f"neutral declaration witness missing: {flag}"
+                )
+            with self.io_for(case.payload) as io:
+                ledgers = self.budgets(io)
+                before = (ledgers.read.source_opens, ledgers.read.total_read_bytes)
+                with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                    acquisition = self.acquire(io, source, ledgers, before)
+                    envelope = self.api()._footer_envelope_from_acquisition(acquisition)
+                    self.assertIsInstance(envelope, bounded_parquet._FooterEnvelope)
+                    profile = bounded_parquet._profile_footer_envelope(
+                        envelope, budget=ledgers.footer
+                    )
+                    yield SimpleNamespace(
+                        io=io,
+                        case=case,
+                        ledgers=ledgers,
+                        source=source,
+                        acquisition=acquisition,
+                        envelope=envelope,
+                        profile=profile,
+                    )
+            self.assertCountEqual(io.close_attempts, io.acquired)
+
+        return opened()
+
+    def admit(self, env, **changes):
+        values = {"row_group_index": 0, "column_index": 0, "budget": env.ledgers.page}
+        values.update(changes)
+        return self.api()._admit_owned_initial_page_header(
+            env.acquisition, env.envelope, env.profile, **values
+        )
+
+    def policy(self, code, action, *args, **kwargs):
+        with self.assertRaises(PinnedReadRefused) as caught:
+            action(*args, **kwargs)
+        self.assertEqual(caught.exception.reason_code, code)
+
+    def test_actual_owner_footer_and_header_share_one_source_and_exact_ranges(self):
+        with self.composition() as env:
+            owned = self.admit(env)
+            self.assertIsInstance(owned, self.api()._OwnedPageHeaderAdmission)
+            self.assertIs(owned.acquisition, env.acquisition)
+            self.assertIs(owned.profile, env.profile)
+            self.assertIs(owned.chunk, env.profile.chunks[0])
+            self.assertIs(owned.leaf, env.profile.leaves[0])
+            self.assertEqual(owned.page_origin, 64)
+            h = len(env.case.header)
+            self.assertEqual(owned.absolute_header_span, (64, 64 + h))
+            self.assertEqual(owned.absolute_body_span, (64 + h, 64 + h + 7))
+            requests = [(offset, length) for _, length, offset in env.io.positional_requests]
+            size = len(env.case.payload)
+            self.assertEqual(
+                requests[:3], [(0, 4), (size - 8, 8), (env.case.footer_start, len(env.case.footer))]
+            )
+            self.assertEqual(requests[3:], [(64 + index, 1) for index in range(h)])
+            self.assertEqual(env.ledgers.read.total_read_bytes, 12 + len(env.case.footer) + h)
+            self.assertEqual(
+                env.ledgers.page.allocation_bytes, 12 + len(env.case.footer) + h + h * (h + 1) // 2
+            )
+            self.assertEqual(env.ledgers.read.source_opens, len(env.io.open_paths))
+            self.assertFalse(env.envelope.receipt.whole_source_digest_verified)
+            self.assertFalse(env.profile.read_eligible)
+            self.assertFalse(owned.admission.decode_eligible)
+
+    def test_compatibility_wrapper_delegates_without_early_result_construction(self):
+        api = self.api()
+        case = self.fixture()
+        with self.io_for(case.payload) as io:
+            ledgers = self.budgets(io)
+            ledgers.read.source_opens = 2
+            ledgers.read.total_read_bytes = 7
+            events = []
+            original_extent = bounded_parquet._FooterExtent
+            original_receipt = bounded_parquet._FooterEnvelopeReceipt
+            original_envelope = bounded_parquet._FooterEnvelope
+
+            def construct(factory, *args, **kwargs):
+                self.assertCountEqual(io.close_attempts, io.acquired)
+                events.append(factory.__name__)
+                return factory(*args, **kwargs)
+
+            with (
+                patch.object(
+                    bounded_parquet, "_read_footer_from_source", wraps=api._read_footer_from_source
+                ) as acquire,
+                patch.object(
+                    bounded_parquet,
+                    "_FooterExtent",
+                    side_effect=lambda *a, **k: construct(original_extent, *a, **k),
+                ),
+                patch.object(
+                    bounded_parquet,
+                    "_FooterEnvelopeReceipt",
+                    side_effect=lambda *a, **k: construct(original_receipt, *a, **k),
+                ),
+                patch.object(
+                    bounded_parquet,
+                    "_FooterEnvelope",
+                    side_effect=lambda *a, **k: construct(original_envelope, *a, **k),
+                ),
+            ):
+                envelope = FooterEnvelopeTests().envelope(io, budget=ledgers.read)
+            acquire.assert_called_once()
+            self.assertEqual(acquire.call_args.kwargs["receipt_before"], (2, 7))
+            self.assertIsNone(acquire.call_args.kwargs.get("page_budget"))
+            self.assertEqual(events, ["_FooterExtent", "_FooterEnvelopeReceipt", "_FooterEnvelope"])
+            self.assertEqual(envelope.receipt.total_read_bytes_before, 7)
+            self.assertEqual(envelope.receipt.total_read_bytes_after, 19 + len(case.footer))
+            self.assertEqual(ledgers.page.allocation_bytes, 0)
+
+    def test_outer_ownership_and_scalar_mismatches_precede_clock_or_header_read(self):
+        with self.composition() as env:
+            api = self.api()
+            other = self.budgets(env.io)
+            bad_tokens = (
+                replace(env.acquisition, read_budget=other.read),
+                replace(env.acquisition, page_budget=other.page),
+                replace(env.acquisition, wire_budget=other.wire),
+                replace(env.acquisition, source_size=env.acquisition.source_size + 1),
+                replace(env.acquisition, source_identity=(9, 9, 9, 9, 9)),
+            )
+            for token in bad_tokens:
+                with self.subTest(token=repr(type(token))):
+                    before = (
+                        len(env.io.events),
+                        len(env.io.positional_requests),
+                        env.ledgers.page.work_units,
+                    )
+                    self.policy(
+                        "invalid_contract",
+                        api._admit_owned_initial_page_header,
+                        token,
+                        env.envelope,
+                        env.profile,
+                        row_group_index=0,
+                        column_index=0,
+                        budget=env.ledgers.page,
+                    )
+                    self.assertEqual(
+                        before,
+                        (
+                            len(env.io.events),
+                            len(env.io.positional_requests),
+                            env.ledgers.page.work_units,
+                        ),
+                    )
+            for value in (True, -1, "0", None):
+                with self.subTest(index=value):
+                    self.policy("invalid_contract", self.admit, env, row_group_index=value)
+
+    def test_detached_payload_extent_document_and_cloned_budget_are_not_binding(self):
+        with self.composition() as env:
+            api = self.api()
+            other_payload = bytes(bytearray(env.envelope.payload))
+            self.assertIsNot(other_payload, env.envelope.payload)
+            invalid = (
+                (replace(env.envelope, payload=other_payload), env.profile, env.ledgers.page),
+                (
+                    replace(env.envelope, extent=replace(env.envelope.extent)),
+                    env.profile,
+                    env.ledgers.page,
+                ),
+                (
+                    env.envelope,
+                    replace(
+                        env.profile, document=replace(env.profile.document, payload=other_payload)
+                    ),
+                    env.ledgers.page,
+                ),
+                (env.envelope, env.profile, self.budgets(env.io).page),
+            )
+            for envelope, profile, pages in invalid:
+                with self.subTest(case=len(env.io.events)):
+                    before = (len(env.io.events), env.ledgers.page.work_units)
+                    self.policy(
+                        "invalid_contract",
+                        api._admit_owned_initial_page_header,
+                        env.acquisition,
+                        envelope,
+                        profile,
+                        row_group_index=0,
+                        column_index=0,
+                        budget=pages,
+                    )
+                    self.assertEqual(before, (len(env.io.events), env.ledgers.page.work_units))
+
+    def test_literal_footer_reservations_and_receipt_prefix_are_exact(self):
+        payload = b"PAR1" + b"\x00" * 16 + b"\x00" * 4 + (4).to_bytes(4, "little") + b"PAR1"
+        with self.io_for(payload) as io:
+            ledgers = self.budgets(
+                io,
+                read={"max_total_read_bytes": 23},
+                page={"max_allocation_bytes": 21, "max_work_units": 12},
+            )
+            ledgers.read.source_opens = 2
+            ledgers.read.total_read_bytes = 7
+            ledgers.page.allocation_bytes = 5
+            ledgers.page.work_units = 9
+            with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                clocks = io.events.count("clock")
+                token = self.acquire(io, source, ledgers, (2, 7))
+                self.assertEqual(io.events.count("clock") - clocks, 9)
+                self.assertEqual(token.receipt_before, (2, 7))
+                self.assertEqual(token.receipt_after, (6, 23))
+                envelope = self.api()._footer_envelope_from_acquisition(token)
+                self.assertIsInstance(envelope, bounded_parquet._FooterEnvelope)
+                self.assertEqual(envelope.receipt.ranges, ((0, 4), (24, 32), (20, 24)))
+                self.assertEqual(
+                    (
+                        ledgers.read.total_read_bytes,
+                        ledgers.page.allocation_bytes,
+                        ledgers.page.work_units,
+                    ),
+                    (23, 21, 12),
+                )
+
+    def test_literal_one_below_limits_keep_only_the_admitted_prefix(self):
+        payload = b"PAR1" + b"\x00" * 20 + (4).to_bytes(4, "little") + b"PAR1"
+        for axis in ("allocation", "work", "read"):
+            with self.subTest(axis=axis), self.io_for(payload) as io:
+                read = {"max_total_read_bytes": 22 if axis == "read" else 23}
+                page = {
+                    "max_allocation_bytes": 20 if axis == "allocation" else 21,
+                    "max_work_units": 11 if axis == "work" else 12,
+                }
+                ledgers = self.budgets(io, read=read, page=page)
+                ledgers.read.total_read_bytes = 7
+                ledgers.page.allocation_bytes = 5
+                ledgers.page.work_units = 9
+                before = (0, 7)
+                with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                    self.policy(
+                        "resource_limit",
+                        self.api()._read_footer_from_source,
+                        source,
+                        max_footer_bytes=32,
+                        max_retained_payload_bytes=32,
+                        budget=ledgers.read,
+                        receipt_before=before,
+                        page_budget=ledgers.page,
+                    )
+                self.assertEqual(
+                    (
+                        ledgers.read.total_read_bytes,
+                        ledgers.page.allocation_bytes,
+                        ledgers.page.work_units,
+                    ),
+                    (19, 17, 11),
+                )
+                self.assertEqual(len(io.positional_requests), 2)
+
+    def test_short_read_and_post_read_deadline_retain_actual_bytes_and_reservations(self):
+        payload = b"PAR1" + b"\x00" * 20 + (4).to_bytes(4, "little") + b"PAR1"
+        for fault, expected_read in (("short", 21), ("deadline", 23)):
+            with self.subTest(fault=fault), self.io_for(payload) as io:
+                ledgers = self.budgets(io)
+                ledgers.read.total_read_bytes = 7
+                ledgers.page.allocation_bytes = 5
+                ledgers.page.work_units = 9
+                if fault == "short":
+                    io.responses[20, 4] = b"\x00\x00"
+                else:
+                    io.expire_after = "pread:3"
+                error = (
+                    io.module.TimestampMetadataRefused if fault == "short" else PinnedReadRefused
+                )
+                with (
+                    self.assertRaises(error),
+                    FooterEnvelopeTests().owner(io, ledgers.read) as source,
+                ):
+                    self.api()._read_footer_from_source(
+                        source,
+                        max_footer_bytes=32,
+                        max_retained_payload_bytes=32,
+                        budget=ledgers.read,
+                        receipt_before=(0, 7),
+                        page_budget=ledgers.page,
+                    )
+                self.assertEqual(
+                    (
+                        ledgers.read.total_read_bytes,
+                        ledgers.page.allocation_bytes,
+                        ledgers.page.work_units,
+                    ),
+                    (expected_read, 21, 12),
+                )
+                self.assertEqual(len(io.positional_requests), 3)
+
+    def test_range_cap_refusal_retains_full_requested_footer_reservation(self):
+        n = 1048577
+        payload = b"PAR1" + b"\x00" * n + n.to_bytes(4, "little") + b"PAR1"
+        with self.io_for(payload) as io:
+            ledgers = self.budgets(io)
+            with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                self.policy(
+                    "resource_limit",
+                    self.api()._read_footer_from_source,
+                    source,
+                    max_footer_bytes=n,
+                    max_retained_payload_bytes=n + 12,
+                    budget=ledgers.read,
+                    receipt_before=(0, 0),
+                    page_budget=ledgers.page,
+                )
+            self.assertEqual(ledgers.read.total_read_bytes, 12)
+            self.assertEqual((ledgers.page.allocation_bytes, ledgers.page.work_units), (n + 12, 3))
+            self.assertEqual(len(io.positional_requests), 2)
+
+    def test_final_pre_read_deadline_keeps_request_reservation_without_read(self):
+        payload = b"PAR1" + b"\x00" * 20 + (4).to_bytes(4, "little") + b"PAR1"
+        with self.io_for(payload) as io:
+            ledgers = self.budgets(io)
+            ledgers.read.total_read_bytes = 7
+            ledgers.page.allocation_bytes = 5
+            ledgers.page.work_units = 9
+            calls = []
+
+            def clock():
+                calls.append(1)
+                return 100 if len(calls) >= 8 else 1
+
+            with (
+                self.assertRaises(PinnedReadRefused) as caught,
+                FooterEnvelopeTests().owner(io, ledgers.read) as source,
+            ):
+                ledgers.read.clock_ns = clock
+                self.api()._read_footer_from_source(
+                    source,
+                    max_footer_bytes=32,
+                    max_retained_payload_bytes=32,
+                    budget=ledgers.read,
+                    receipt_before=(0, 7),
+                    page_budget=ledgers.page,
+                )
+            self.assertEqual(caught.exception.reason_code, "deadline_exceeded")
+            self.assertEqual(
+                (
+                    ledgers.read.total_read_bytes,
+                    ledgers.page.allocation_bytes,
+                    ledgers.page.work_units,
+                ),
+                (19, 21, 12),
+            )
+            self.assertEqual(len(io.positional_requests), 2)
+
+    def test_footer_os_failure_retains_request_charge_and_primary_error(self):
+        payload = b"PAR1" + b"\x00" * 20 + (4).to_bytes(4, "little") + b"PAR1"
+        with self.io_for(payload) as io:
+            ledgers = self.budgets(io)
+            ledgers.read.total_read_bytes = 7
+            ledgers.page.allocation_bytes = 5
+            ledgers.page.work_units = 9
+            marker = OSError("neutral positional witness")
+            io.fail_pread = 3
+            io.pread_error = marker
+            with (
+                self.assertRaises(OSError) as caught,
+                FooterEnvelopeTests().owner(io, ledgers.read) as source,
+            ):
+                self.api()._read_footer_from_source(
+                    source,
+                    max_footer_bytes=32,
+                    max_retained_payload_bytes=32,
+                    budget=ledgers.read,
+                    receipt_before=(0, 7),
+                    page_budget=ledgers.page,
+                )
+            self.assertIs(caught.exception, marker)
+            self.assertEqual(
+                (
+                    ledgers.read.total_read_bytes,
+                    ledgers.page.allocation_bytes,
+                    ledgers.page.work_units,
+                ),
+                (19, 21, 12),
+            )
+            self.assertEqual(len(io.positional_requests), 3)
+
+    def test_borrowed_helper_rejects_bad_snapshots_and_foreign_budget_before_clock(self):
+        payload = b"PAR1" + b"\x00" * 20 + (4).to_bytes(4, "little") + b"PAR1"
+        with self.io_for(payload) as io:
+            ledgers = self.budgets(io)
+            with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                cases = (
+                    {"receipt_before": (True, 0)},
+                    {"receipt_before": (0,)},
+                    {"receipt_before": (ledgers.read.source_opens, 0)},
+                    {"receipt_before": (0, 1)},
+                    {"budget": self.budgets(io).read},
+                    {"page_budget": self.budgets(io).page},
+                )
+                for changes in cases:
+                    with self.subTest(keys=tuple(changes)):
+                        values: dict[str, object] = {
+                            "max_footer_bytes": 32,
+                            "max_retained_payload_bytes": 32,
+                            "budget": ledgers.read,
+                            "receipt_before": (0, 0),
+                            "page_budget": ledgers.page,
+                        }
+                        values.update(changes)
+                        before = (
+                            len(io.events),
+                            len(io.positional_requests),
+                            ledgers.page.allocation_bytes,
+                            ledgers.page.work_units,
+                        )
+                        self.policy(
+                            "invalid_contract",
+                            self.api()._read_footer_from_source,
+                            source,
+                            **values,
+                        )
+                        self.assertEqual(
+                            before,
+                            (
+                                len(io.events),
+                                len(io.positional_requests),
+                                ledgers.page.allocation_bytes,
+                                ledgers.page.work_units,
+                            ),
+                        )
+
+    def test_binding_lookup_work_is_separate_from_actual_header_parser_work(self):
+        with self.composition() as env:
+            original = bounded_parquet._admit_page_header
+            observed = []
+            start = env.ledgers.page.work_units
+
+            def actual(cursor, *, chunk_remaining_bytes, budget):
+                observed.append(budget.work_units)
+                result = original(
+                    cursor, chunk_remaining_bytes=chunk_remaining_bytes, budget=budget
+                )
+                observed.append(budget.work_units)
+                return result
+
+            with patch.object(bounded_parquet, "_admit_page_header", side_effect=actual):
+                owned = self.admit(env)
+            self.assertIsInstance(owned, self.api()._OwnedPageHeaderAdmission)
+            self.assertEqual(len(observed), 2)
+            self.assertEqual(observed[0] - start, 4)
+            self.assertEqual(env.ledgers.page.work_units - observed[1], 1)
+            self.assertIs(env.ledgers.footer.wire_budget, env.ledgers.page.wire_budget)
+            self.assertIs(env.ledgers.page.read_budget, env.ledgers.read)
+
+    def test_all_twenty_three_capabilities_have_declaration_backed_outcomes(self):
+        self.assertEqual(
+            set(self.metadata_flags) | set(self.blocked_flags), FooterProfileTests.FLAGS
+        )
+        for flag in (*self.metadata_flags, *self.blocked_flags):
+            with self.subTest(flag=flag), self.composition(self.fixture((flag,))) as env:
+                self.assertIn(flag, env.profile.flags)
+                before = len(env.io.positional_requests)
+                if flag in self.blocked_flags:
+                    self.policy("unsupported_mode", self.admit, env)
+                    self.assertEqual(len(env.io.positional_requests), before)
+                else:
+                    owned = self.admit(env)
+                    self.assertIsInstance(owned, self.api()._OwnedPageHeaderAdmission)
+                    self.assertIn(flag, owned.profile.flags)
+                    self.assertFalse(owned.profile.read_eligible)
+
+    def test_unselected_column_markers_do_not_become_selected_column_policy(self):
+        for flag in (
+            "external_column_reference",
+            "column_encryption_present",
+            "encrypted_column_metadata_present",
+        ):
+            with (
+                self.subTest(flag=flag),
+                self.composition(self.fixture(other_flags=(flag,))) as env,
+            ):
+                self.assertIn(flag, env.profile.flags)
+                owned = self.admit(env)
+                self.assertIsInstance(owned, self.api()._OwnedPageHeaderAdmission)
+                self.assertEqual(owned.chunk.column_index, 0)
+                self.assertNotIn(flag, owned.chunk.flags | owned.leaf.flags)
+
+    def test_refuse_wins_and_global_blockers_are_not_overridden(self):
+        cases = (
+            (("opaque_metadata_present", "external_column_reference"), (), False),
+            (("root_repetition_present", "arrow_schema_metadata_present"), (), True),
+            (("footer_signing_metadata_present",), ("column_encryption_present",), False),
+            ((), ("primitive_child_count_present",), False),
+        )
+        for flags, other, allowed in cases:
+            with (
+                self.subTest(flags=flags, other=other),
+                self.composition(self.fixture(flags, other_flags=other)) as env,
+            ):
+                if "primitive_child_count_present" in other:
+                    self.assertIn("unresolved_schema_tree", env.profile.flags)
+                    self.assertNotIn(
+                        "primitive_child_count_present",
+                        env.profile.chunks[0].flags | env.profile.leaves[0].flags,
+                    )
+                before = len(env.io.positional_requests)
+                if allowed:
+                    self.assertIsInstance(self.admit(env), self.api()._OwnedPageHeaderAdmission)
+                else:
+                    self.policy("unsupported_mode", self.admit, env)
+                    self.assertEqual(len(env.io.positional_requests), before)
+
+    def test_unknown_flag_and_invalid_private_flag_container_refuse(self):
+        with self.composition() as env:
+            api = self.api()
+            for flags in (frozenset({"not-a-declared-capability"}), set(), frozenset({1})):
+                with self.subTest(flags=repr(flags)):
+                    profile = replace(env.profile, flags=flags)
+                    self.policy(
+                        "invalid_contract",
+                        api._admit_owned_initial_page_header,
+                        env.acquisition,
+                        env.envelope,
+                        profile,
+                        row_group_index=0,
+                        column_index=0,
+                        budget=env.ledgers.page,
+                    )
+
+    def test_initial_dictionary_origin_and_actual_header_type_must_agree(self):
+        with self.composition(self.fixture(dictionary=True)) as env:
+            owned = self.admit(env)
+            self.assertIsInstance(owned, self.api()._OwnedPageHeaderAdmission)
+            self.assertEqual(owned.page_origin, 64)
+            self.assertEqual(owned.admission.page_type, 2)
+            self.assertTrue(
+                all(
+                    offset < 64 + len(env.case.header)
+                    for _, _, offset in env.io.positional_requests[3:]
+                )
+            )
+        with self.composition(self.fixture(dictionary=True, kind=0)) as env:
+            with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+                self.admit(env)
+            self.assertEqual(caught.exception.reason_code, "schema_mismatch")
+
+    def test_missing_duplicate_and_empty_chunk_requests_do_not_acquire_headers(self):
+        with self.composition() as env:
+            api = self.api()
+            before = len(env.io.positional_requests)
+            self.policy("invalid_contract", self.admit, env, column_index=4)
+            duplicate = replace(env.profile, chunks=(env.profile.chunks[0], env.profile.chunks[0]))
+            self.policy(
+                "invalid_contract",
+                api._admit_owned_initial_page_header,
+                env.acquisition,
+                env.envelope,
+                duplicate,
+                row_group_index=0,
+                column_index=0,
+                budget=env.ledgers.page,
+            )
+            empty = replace(
+                env.profile.chunks[0],
+                candidate_extent=(64, 64),
+                compressed_size=0,
+                uncompressed_size=0,
+                num_values=0,
+            )
+            profile = replace(env.profile, chunks=(empty,))
+            self.policy(
+                "invalid_contract",
+                api._admit_owned_initial_page_header,
+                env.acquisition,
+                env.envelope,
+                profile,
+                row_group_index=0,
+                column_index=0,
+                budget=env.ledgers.page,
+            )
+            self.assertEqual(len(env.io.positional_requests), before)
+
+    def test_closed_acquisition_precedes_clock_and_cannot_reopen(self):
+        with self.composition() as env:
+            owned = self.admit(env)
+            self.assertIsInstance(owned, self.api()._OwnedPageHeaderAdmission)
+        before = (len(env.io.events), len(env.io.open_paths), len(env.io.positional_requests))
+        self.policy("invalid_contract", self.admit, env)
+        self.assertEqual(
+            before, (len(env.io.events), len(env.io.open_paths), len(env.io.positional_requests))
+        )
+
+    def test_source_identity_and_cleanup_failure_prevent_envelope_construction(self):
+        for fault in ("identity", "close"):
+            with self.subTest(fault=fault), self.io_for(self.fixture().payload) as io:
+                ledgers = self.budgets(io)
+                if fault == "identity":
+                    io.after = io.metadata(st_ino=99)
+                else:
+                    io.close_errors[14] = OSError("neutral close witness")
+                original = bounded_parquet._FooterEnvelope
+                with (
+                    patch.object(bounded_parquet, "_FooterEnvelope", wraps=original) as constructor,
+                    self.assertRaises((io.module.TimestampMetadataRefused, OSError)),
+                ):
+                    FooterEnvelopeTests().envelope(io, budget=ledgers.read)
+                constructor.assert_not_called()
+                self.assertCountEqual(io.close_attempts, io.acquired)
+
+    def test_primary_consumer_error_retains_cleanup_error_without_retry(self):
+        with self.io_for(self.fixture().payload) as io:
+            ledgers = self.budgets(io)
+            marker = RuntimeError("neutral primary witness")
+            close_error = OSError("neutral cleanup witness")
+            io.close_errors[14] = close_error
+            with (
+                self.assertRaises(RuntimeError) as caught,
+                FooterEnvelopeTests().owner(io, ledgers.read) as source,
+            ):
+                self.acquire(io, source, ledgers, (0, 0))
+                raise marker
+            self.assertIs(caught.exception, marker)
+            self.assertIsNone(marker.__cause__)
+            state = BaseException.__dict__["__dict__"].__get__(marker, BaseException)
+            self.assertEqual(state[io.module._PINNED_CLEANUP_ERRORS], (close_error,))
+            self.assertEqual(len(io.positional_requests), 3)
+            self.assertCountEqual(io.close_attempts, io.acquired)
+
+    def manual_consumer_token(self, io, source, ledgers, before, *, integrated):
+        read_range = io.module._read_pinned_range
+        size = source.size
+
+        def read(offset, length):
+            if integrated:
+                ledgers.page.reserve(
+                    bounded_parquet._PageCharge(allocation_bytes=length, work_units=1)
+                )
+            return read_range(source, offset=offset, length=length)
+
+        self.assertEqual(read(0, 4), b"PAR1")
+        trailer = read(size - 8, 8)
+        self.assertEqual(trailer[4:], b"PAR1")
+        length = int.from_bytes(trailer[:4], "little")
+        start = size - 8 - length
+        payload = read(start, length)
+        return self.api()._LiveFooterAcquisition(
+            source=source,
+            read_budget=ledgers.read,
+            page_budget=ledgers.page if integrated else None,
+            wire_budget=ledgers.wire if integrated else None,
+            source_identity=source.identity,
+            source_size=size,
+            footer_start=start,
+            footer_end=size - 8,
+            payload=payload,
+            receipt_before=before,
+            receipt_after=(ledgers.read.source_opens, ledgers.read.total_read_bytes),
+        )
+
+    def manual_consumer_environment(self, fixture=None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def opened():
+            case = self.fixture() if fixture is None else fixture
+            with self.io_for(case.payload) as io:
+                ledgers = self.budgets(io)
+                before = (ledgers.read.source_opens, ledgers.read.total_read_bytes)
+                with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                    token = self.manual_consumer_token(io, source, ledgers, before, integrated=True)
+                    extent = bounded_parquet._FooterExtent(
+                        token.source_size, token.footer_start, token.footer_end
+                    )
+                    receipt = bounded_parquet._FooterEnvelopeReceipt(
+                        token.receipt_before[0],
+                        token.receipt_after[0],
+                        token.receipt_before[1],
+                        token.receipt_after[1],
+                        (
+                            (0, 4),
+                            (token.footer_end, token.source_size),
+                            (token.footer_start, token.footer_end),
+                        ),
+                        False,
+                    )
+                    envelope = bounded_parquet._FooterEnvelope(
+                        token.payload, extent, token.source_identity, receipt, ledgers.read
+                    )
+                    profile = bounded_parquet._profile_footer_envelope(
+                        envelope, budget=ledgers.footer
+                    )
+                    yield SimpleNamespace(
+                        io=io,
+                        case=case,
+                        ledgers=ledgers,
+                        source=source,
+                        acquisition=token,
+                        envelope=envelope,
+                        profile=profile,
+                    )
+            self.assertCountEqual(io.close_attempts, io.acquired)
+
+        return opened()
+
+    def test_pure_factory_receipt_tuples_cached_geometry_and_payload_refuse(self):
+        case = self.fixture()
+        with self.io_for(case.payload) as io:
+            ledgers = self.budgets(io)
+            before = (0, 0)
+            with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                token = self.manual_consumer_token(io, source, ledgers, before, integrated=False)
+                cases = (
+                    {"receipt_before": ()},
+                    {"receipt_before": (True, 0)},
+                    {"receipt_before": (-1, 0)},
+                    {
+                        "receipt_after": (
+                            ledgers.read.source_opens + 1,
+                            ledgers.read.total_read_bytes,
+                        )
+                    },
+                    {
+                        "receipt_after": (
+                            ledgers.read.source_opens,
+                            ledgers.read.total_read_bytes + 1,
+                        )
+                    },
+                    {"receipt_after": (ledgers.read.source_opens,)},
+                    {"source_size": token.source_size + 1},
+                    {"source_identity": (9, 9, 9, 9, 9)},
+                    {"footer_start": -1},
+                    {"footer_end": token.footer_end + 1},
+                    {"payload": token.payload[:-1]},
+                )
+                for changes in cases:
+                    with self.subTest(fields=tuple(changes)):
+                        bad = replace(token, **changes)
+                        checkpoint = (
+                            len(io.events),
+                            len(io.positional_requests),
+                            ledgers.read.source_opens,
+                            ledgers.read.total_read_bytes,
+                            ledgers.page.work_units,
+                            ledgers.page.allocation_bytes,
+                        )
+                        self.policy(
+                            "invalid_contract", self.api()._footer_envelope_from_acquisition, bad
+                        )
+                        self.assertEqual(
+                            checkpoint,
+                            (
+                                len(io.events),
+                                len(io.positional_requests),
+                                ledgers.read.source_opens,
+                                ledgers.read.total_read_bytes,
+                                ledgers.page.work_units,
+                                ledgers.page.allocation_bytes,
+                            ),
+                        )
+
+    def test_pure_factory_current_counter_drift_is_not_a_cached_receipt(self):
+        for axis in ("source_opens", "total_read_bytes"):
+            with self.subTest(axis=axis), self.io_for(self.fixture().payload) as io:
+                ledgers = self.budgets(io)
+                with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                    token = self.manual_consumer_token(
+                        io, source, ledgers, (0, 0), integrated=False
+                    )
+                    setattr(ledgers.read, axis, getattr(ledgers.read, axis) + 1)
+                    checkpoint = (
+                        len(io.events),
+                        len(io.positional_requests),
+                        ledgers.read.source_opens,
+                        ledgers.read.total_read_bytes,
+                    )
+                    self.policy(
+                        "invalid_contract", self.api()._footer_envelope_from_acquisition, token
+                    )
+                    self.assertEqual(
+                        checkpoint,
+                        (
+                            len(io.events),
+                            len(io.positional_requests),
+                            ledgers.read.source_opens,
+                            ledgers.read.total_read_bytes,
+                        ),
+                    )
+
+    def test_pure_factory_valid_post_cleanup_token_performs_no_source_operation(self):
+        with self.io_for(self.fixture().payload) as io:
+            ledgers = self.budgets(io)
+            with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                token = self.manual_consumer_token(io, source, ledgers, (0, 0), integrated=False)
+            self.assertTrue(source._closed)
+            checkpoint = (
+                len(io.events),
+                len(io.positional_requests),
+                ledgers.read.source_opens,
+                ledgers.read.total_read_bytes,
+            )
+            envelope = self.api()._footer_envelope_from_acquisition(token)
+            self.assertIsInstance(envelope, bounded_parquet._FooterEnvelope)
+            self.assertIs(envelope.payload, token.payload)
+            self.assertIs(envelope.read_budget, ledgers.read)
+            self.assertEqual(envelope.source_identity, token.source_identity)
+            self.assertEqual(
+                (envelope.receipt.source_opens_before, envelope.receipt.total_read_bytes_before),
+                token.receipt_before,
+            )
+            self.assertEqual(
+                (envelope.receipt.source_opens_after, envelope.receipt.total_read_bytes_after),
+                token.receipt_after,
+            )
+            self.assertFalse(envelope.receipt.whole_source_digest_verified)
+            self.assertEqual(
+                checkpoint,
+                (
+                    len(io.events),
+                    len(io.positional_requests),
+                    ledgers.read.source_opens,
+                    ledgers.read.total_read_bytes,
+                ),
+            )
+
+    def test_initial_header_rejects_current_counter_drift_before_clock(self):
+        for axis in ("source_opens", "total_read_bytes"):
+            with self.subTest(axis=axis), self.manual_consumer_environment() as env:
+                setattr(env.ledgers.read, axis, getattr(env.ledgers.read, axis) + 1)
+                checkpoint = (
+                    len(env.io.events),
+                    len(env.io.positional_requests),
+                    env.ledgers.page.work_units,
+                    env.ledgers.page.allocation_bytes,
+                )
+                self.policy("invalid_contract", self.admit, env)
+                self.assertEqual(
+                    checkpoint,
+                    (
+                        len(env.io.events),
+                        len(env.io.positional_requests),
+                        env.ledgers.page.work_units,
+                        env.ledgers.page.allocation_bytes,
+                    ),
+                )
+
+    def test_multi_entry_owner_work_prefix_refusals_precede_header_acquisition(self):
+        for admitted in (0, 1, 2, 3, 4, 5):
+            with (
+                self.subTest(admitted=admitted),
+                self.manual_consumer_environment(
+                    self.fixture(other_flags=("opaque_metadata_present",))
+                ) as env,
+            ):
+                self.assertEqual((len(env.profile.chunks), len(env.profile.leaves)), (2, 2))
+                pages = env.ledgers.page
+                start = pages.work_units
+                pages.limits = replace(pages.limits, max_work_units=start + admitted)
+                checkpoint = (
+                    len(env.io.positional_requests),
+                    env.ledgers.read.total_read_bytes,
+                    pages.allocation_bytes,
+                    pages.pages,
+                    pages.compressed_bytes,
+                    pages.uncompressed_bytes,
+                    pages.values,
+                )
+                with patch.object(
+                    bounded_parquet,
+                    "_admit_page_header",
+                    side_effect=AssertionError("header parser before owner quota"),
+                ):
+                    self.policy("resource_limit", self.admit, env)
+                self.assertEqual(pages.work_units, start + admitted)
+                self.assertEqual(
+                    checkpoint,
+                    (
+                        len(env.io.positional_requests),
+                        env.ledgers.read.total_read_bytes,
+                        pages.allocation_bytes,
+                        pages.pages,
+                        pages.compressed_bytes,
+                        pages.uncompressed_bytes,
+                        pages.values,
+                    ),
+                )
+
+    def test_multi_entry_exact_and_one_below_result_work_preserve_real_parser_charges(self):
+        case = self.fixture(other_flags=("opaque_metadata_present",))
+        real_parser = bounded_parquet._admit_page_header
+        resident_cursor, resident_budget = PageHeaderAdmissionTests().context(case.header)
+        reference = real_parser(
+            resident_cursor, chunk_remaining_bytes=len(case.header) + 7, budget=resident_budget
+        )
+        self.assertEqual(reference.header_end, len(case.header))
+        parser_work = resident_budget.work_units + 3 * len(case.header)
+        for final_units in (0, 1):
+            with (
+                self.subTest(final_units=final_units),
+                self.manual_consumer_environment(case) as env,
+            ):
+                self.assertEqual((len(env.profile.chunks), len(env.profile.leaves)), (2, 2))
+                pages = env.ledgers.page
+                start = pages.work_units
+                pages.limits = replace(
+                    pages.limits, max_work_units=start + 6 + parser_work + final_units
+                )
+                requests = len(env.io.positional_requests)
+                observed = []
+
+                def actual(cursor, *, chunk_remaining_bytes, budget, observed=observed):
+                    observed.append(budget.work_units)
+                    result = real_parser(
+                        cursor, chunk_remaining_bytes=chunk_remaining_bytes, budget=budget
+                    )
+                    observed.append(budget.work_units)
+                    return result
+
+                with patch.object(bounded_parquet, "_admit_page_header", side_effect=actual):
+                    if final_units:
+                        owned = self.admit(env)
+                        self.assertIsInstance(owned, self.api()._OwnedPageHeaderAdmission)
+                    else:
+                        self.policy("resource_limit", self.admit, env)
+                self.assertEqual(observed, [start + 6, start + 6 + parser_work])
+                self.assertEqual(pages.work_units, start + 6 + parser_work + final_units)
+                self.assertEqual(len(env.io.positional_requests) - requests, len(case.header))
+                self.assertEqual(
+                    (pages.pages, pages.compressed_bytes, pages.uncompressed_bytes, pages.values),
+                    (1, 7, 7, 3),
+                )
+
+    def test_pure_factory_rejects_foreign_tokens_and_unpaired_compatibility_wire(self):
+        with self.manual_consumer_environment() as env:
+            api = self.api()
+            before = (
+                len(env.io.events),
+                len(env.io.positional_requests),
+                env.ledgers.read.total_read_bytes,
+                env.ledgers.page.work_units,
+                env.ledgers.page.allocation_bytes,
+            )
+            tokens = (None, replace(env.acquisition, page_budget=None))
+            with patch.object(
+                env.ledgers.read, "clock_ns", side_effect=AssertionError("pure factory clock")
+            ):
+                for token in tokens:
+                    with self.subTest(token=type(token).__name__):
+                        self.policy(
+                            "invalid_contract", api._footer_envelope_from_acquisition, token
+                        )
+                        self.assertEqual(
+                            before,
+                            (
+                                len(env.io.events),
+                                len(env.io.positional_requests),
+                                env.ledgers.read.total_read_bytes,
+                                env.ledgers.page.work_units,
+                                env.ledgers.page.allocation_bytes,
+                            ),
+                        )
+
+    def test_footer_range_preflight_refuses_before_clock_reservation_or_io(self):
+        case = self.fixture()
+        read_range = bounded_parquet._live_footer_read
+        with self.io_for(case.payload) as io:
+            ledgers = self.budgets(io, read={"max_total_read_bytes": 1})
+            with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                before = (
+                    len(io.events),
+                    len(io.positional_requests),
+                    ledgers.read.total_read_bytes,
+                )
+                axes = {axis: getattr(ledgers.page, axis) for axis in PageBudgetTests.axes}
+                cases = (
+                    (source, 0, 0, "invalid_contract"),
+                    (source, source.size - 1, 2, "invalid_contract"),
+                    (None, 0, 1, "invalid_contract"),
+                    (source, 0, 2, "resource_limit"),
+                )
+                with patch.object(
+                    ledgers.read, "clock_ns", side_effect=AssertionError("range preflight clock")
+                ):
+                    for selected, offset, length, reason in cases:
+                        with self.subTest(offset=offset, length=length, reason=reason):
+                            self.policy(reason, read_range, selected, offset, length, ledgers.page)
+                            self.assertEqual(
+                                before,
+                                (
+                                    len(io.events),
+                                    len(io.positional_requests),
+                                    ledgers.read.total_read_bytes,
+                                ),
+                            )
+                            self.assertEqual(
+                                axes,
+                                {
+                                    axis: getattr(ledgers.page, axis)
+                                    for axis in PageBudgetTests.axes
+                                },
+                            )
+            self.assertCountEqual(io.close_attempts, io.acquired)
+
+    def test_metered_lookup_rejects_malformed_duplicate_and_missing_members(self):
+        with self.manual_consumer_environment() as env:
+            profile = env.profile
+            chunk, leaf = profile.chunks[0], profile.leaves[0]
+            cases = (
+                ("malformed chunk", replace(profile, chunks=(None,)), 2),
+                (
+                    "boolean schema index",
+                    replace(profile, chunks=(replace(chunk, schema_index=True),)),
+                    2,
+                ),
+                (
+                    "negative schema index",
+                    replace(profile, chunks=(replace(chunk, schema_index=-1),)),
+                    2,
+                ),
+                ("malformed leaf", replace(profile, leaves=(None,)), 3),
+                (
+                    "boolean leaf index",
+                    replace(profile, leaves=(replace(leaf, schema_index=True),)),
+                    3,
+                ),
+                ("duplicate leaf", replace(profile, leaves=(leaf, leaf)), 4),
+                ("missing leaf", replace(profile, leaves=()), 2),
+            )
+            for label, candidate, work in cases:
+                with self.subTest(case=label):
+                    axes = {axis: getattr(env.ledgers.page, axis) for axis in PageBudgetTests.axes}
+                    before = (
+                        len(env.io.positional_requests),
+                        env.ledgers.read.source_opens,
+                        env.ledgers.read.total_read_bytes,
+                    )
+                    clocks = env.io.events.count("clock")
+                    self.policy(
+                        "invalid_contract",
+                        self.api()._admit_owned_initial_page_header,
+                        env.acquisition,
+                        env.envelope,
+                        candidate,
+                        row_group_index=0,
+                        column_index=0,
+                        budget=env.ledgers.page,
+                    )
+                    self.assertEqual(
+                        before,
+                        (
+                            len(env.io.positional_requests),
+                            env.ledgers.read.source_opens,
+                            env.ledgers.read.total_read_bytes,
+                        ),
+                    )
+                    self.assertEqual(env.io.events.count("clock") - clocks, work)
+                    self.assertEqual(
+                        {axis: getattr(env.ledgers.page, axis) for axis in PageBudgetTests.axes},
+                        axes | {"work_units": axes["work_units"] + work},
+                    )
+
+    def test_initial_extent_and_origin_refusals_preserve_the_metadata_prefix(self):
+        with self.manual_consumer_environment() as env:
+            profile = env.profile
+            chunk = profile.chunks[0]
+            origin, stop = chunk.candidate_extent
+            cases = (
+                ("unresolved extent", replace(chunk, candidate_extent=None), "unsupported_mode"),
+                (
+                    "mutable extent",
+                    replace(chunk, candidate_extent=[origin, stop]),
+                    "invalid_contract",
+                ),
+                (
+                    "boolean extent",
+                    replace(chunk, candidate_extent=(True, stop)),
+                    "invalid_contract",
+                ),
+                (
+                    "leading magic overlap",
+                    replace(chunk, candidate_extent=(3, stop)),
+                    "unsupported_mode",
+                ),
+                (
+                    "footer overlap",
+                    replace(chunk, candidate_extent=(origin, env.acquisition.footer_start + 1)),
+                    "unsupported_mode",
+                ),
+                (
+                    "dictionary origin",
+                    replace(chunk, dictionary_page_offset=origin + 1),
+                    "unsupported_mode",
+                ),
+                ("data origin", replace(chunk, data_page_offset=origin + 1), "unsupported_mode"),
+            )
+            for label, candidate, reason in cases:
+                with self.subTest(case=label):
+                    axes = {axis: getattr(env.ledgers.page, axis) for axis in PageBudgetTests.axes}
+                    before = (len(env.io.positional_requests), env.ledgers.read.total_read_bytes)
+                    self.policy(
+                        reason,
+                        self.api()._admit_owned_initial_page_header,
+                        env.acquisition,
+                        env.envelope,
+                        replace(profile, chunks=(candidate,)),
+                        row_group_index=0,
+                        column_index=0,
+                        budget=env.ledgers.page,
+                    )
+                    self.assertEqual(
+                        before, (len(env.io.positional_requests), env.ledgers.read.total_read_bytes)
+                    )
+                    self.assertEqual(
+                        {axis: getattr(env.ledgers.page, axis) for axis in PageBudgetTests.axes},
+                        axes | {"work_units": axes["work_units"] + 4},
+                    )
+
+    def test_selected_declaration_refusals_precede_header_acquisition(self):
+        with self.manual_consumer_environment() as env:
+            profile = env.profile
+            chunk, leaf = profile.chunks[0], profile.leaves[0]
+            limit = env.ledgers.wire.limits.max_items_per_container
+            size = len(env.envelope.payload)
+            cases = (
+                (
+                    "missing physical type",
+                    replace(chunk, physical_type=None),
+                    leaf,
+                    "unsupported_mode",
+                ),
+                ("missing codec", replace(chunk, codec=None), leaf, "unsupported_mode"),
+                (
+                    "encoding cardinality",
+                    replace(chunk, encodings=(0,) * (limit + 1)),
+                    leaf,
+                    "invalid_contract",
+                ),
+                ("boolean encoding", replace(chunk, encodings=(False,)), leaf, "unsupported_mode"),
+                ("negative encoding", replace(chunk, encodings=(-1,)), leaf, "unsupported_mode"),
+                ("foreign path span", chunk, replace(leaf, path=(None,)), "unsupported_mode"),
+                (
+                    "out of payload span",
+                    chunk,
+                    replace(leaf, path=(bounded_parquet._FooterSpan(size, size + 1),)),
+                    "unsupported_mode",
+                ),
+            )
+            for label, selected_chunk, selected_leaf, reason in cases:
+                with self.subTest(case=label):
+                    axes = {axis: getattr(env.ledgers.page, axis) for axis in PageBudgetTests.axes}
+                    before = (len(env.io.positional_requests), env.ledgers.read.total_read_bytes)
+                    self.policy(
+                        reason,
+                        self.api()._admit_owned_initial_page_header,
+                        env.acquisition,
+                        env.envelope,
+                        replace(profile, chunks=(selected_chunk,), leaves=(selected_leaf,)),
+                        row_group_index=0,
+                        column_index=0,
+                        budget=env.ledgers.page,
+                    )
+                    self.assertEqual(
+                        before, (len(env.io.positional_requests), env.ledgers.read.total_read_bytes)
+                    )
+                    self.assertEqual(
+                        {axis: getattr(env.ledgers.page, axis) for axis in PageBudgetTests.axes},
+                        axes | {"work_units": axes["work_units"] + 4},
+                    )

@@ -16,7 +16,12 @@ if TYPE_CHECKING:
 
     import polars as pl
 
-    from liq.store.timestamp_metadata import PinnedParquetFile, TimestampFileMetadata
+    from liq.store.timestamp_metadata import (
+        PinnedParquetFile,
+        TimestampFileMetadata,
+        _PinnedSource,
+        _PinnedSourceIdentity,
+    )
 
 
 class PinnedReadRefused(StorageError):
@@ -2446,11 +2451,7 @@ def _read_footer_envelope(
     max_retained_payload_bytes: int,
     budget: _PinnedReadBudget,
 ) -> _FooterEnvelope:
-    from liq.store.timestamp_metadata import (
-        TimestampMetadataRefused,
-        _pinned_source,
-        _read_pinned_range,
-    )
+    from liq.store.timestamp_metadata import _pinned_source
 
     if (
         type(maximum) is not int
@@ -2462,52 +2463,16 @@ def _read_footer_envelope(
         or type(budget) is not _PinnedReadBudget
     ):
         raise PinnedReadRefused("invalid_contract")
-    opens_before = budget.source_opens
-    bytes_before = budget.total_read_bytes
+    before = (budget.source_opens, budget.total_read_bytes)
     with _pinned_source(root, identity, maximum, budget=budget) as source:
-        size = source.size
-        if size < 12:
-            raise TimestampMetadataRefused("footer envelope length")
-        if (
-            max_retained_payload_bytes < 12
-            or budget.limits.max_total_read_bytes - budget.total_read_bytes < 12
-        ):
-            raise PinnedReadRefused("resource_limit")
-        leading = _read_pinned_range(source, offset=0, length=4)
-        if leading != b"PAR1":
-            if leading == b"PARE":
-                raise PinnedReadRefused("unsupported_mode")
-            raise TimestampMetadataRefused("footer envelope magic")
-        trailer_start = size - 8
-        trailing = _read_pinned_range(source, offset=trailer_start, length=8)
-        if not (
-            trailing[4] == 80 and trailing[5] == 65 and trailing[6] == 82 and trailing[7] == 49
-        ):
-            if trailing[4] == 80 and trailing[5] == 65 and trailing[6] == 82 and trailing[7] == 69:
-                raise PinnedReadRefused("unsupported_mode")
-            raise TimestampMetadataRefused("footer envelope magic")
-        footer_length = trailing[0] | (trailing[1] << 8) | (trailing[2] << 16) | (trailing[3] << 24)
-        footer_start = trailer_start - footer_length
-        if footer_length == 0 or footer_start < 4:
-            raise TimestampMetadataRefused("footer envelope length")
-        if (
-            footer_length > max_footer_bytes
-            or footer_length + 12 > max_retained_payload_bytes
-            or footer_length > budget.limits.max_total_read_bytes - budget.total_read_bytes
-        ):
-            raise PinnedReadRefused("resource_limit")
-        payload = _read_pinned_range(source, offset=footer_start, length=footer_length)
-        source_identity = source.identity
-    extent = _FooterExtent(size, footer_start, trailer_start)
-    receipt = _FooterEnvelopeReceipt(
-        opens_before,
-        budget.source_opens,
-        bytes_before,
-        budget.total_read_bytes,
-        ((0, 4), (trailer_start, size), (footer_start, trailer_start)),
-        False,
-    )
-    return _FooterEnvelope(payload, extent, source_identity, receipt, budget)
+        acquisition = _read_footer_from_source(
+            source,
+            max_footer_bytes=max_footer_bytes,
+            max_retained_payload_bytes=max_retained_payload_bytes,
+            budget=budget,
+            receipt_before=before,
+        )
+    return _footer_envelope_from_acquisition(acquisition)
 
 
 def _profile_footer_envelope(envelope: _FooterEnvelope, *, budget: _FooterBudget) -> _FooterProfile:
@@ -3408,3 +3373,485 @@ def _verify_page_crc(
     _page_work(budget)
     if (register ^ 0xFFFFFFFF) != (crc & 0xFFFFFFFF):
         raise _CompactWireMalformed("invalid_wire")
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class _LiveFooterAcquisition:
+    source: _PinnedSource
+    read_budget: _PinnedReadBudget
+    page_budget: _PageBudget | None
+    wire_budget: _CompactWireBudget | None
+    source_identity: _PinnedSourceIdentity
+    source_size: int
+    footer_start: int
+    footer_end: int
+    payload: bytes
+    receipt_before: tuple[int, int]
+    receipt_after: tuple[int, int]
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class _OwnedPageHeaderAdmission:
+    acquisition: _LiveFooterAcquisition
+    envelope: _FooterEnvelope
+    profile: _FooterProfile
+    chunk: _FooterChunkProfile
+    leaf: _FooterLeafProfile
+    page_origin: int
+    admission: _PageHeaderAdmission
+
+    @property
+    def absolute_header_span(self) -> tuple[int, int]:
+        return (
+            self.page_origin + self.admission.header_start,
+            self.page_origin + self.admission.header_end,
+        )
+
+    @property
+    def absolute_body_span(self) -> tuple[int, int]:
+        return (
+            self.page_origin + self.admission.body_start,
+            self.page_origin + self.admission.body_end,
+        )
+
+
+def _live_footer_snapshot(value: tuple[int, int]) -> bool:
+    return (
+        type(value) is tuple
+        and len(value) == 2
+        and all(type(item) is int and item >= 0 for item in value)
+    )
+
+
+def _live_footer_validate(acquisition: _LiveFooterAcquisition) -> None:
+    from liq.store.timestamp_metadata import _PinnedSource
+
+    if type(acquisition) is not _LiveFooterAcquisition:
+        raise PinnedReadRefused("invalid_contract")
+    source = acquisition.source
+    read = acquisition.read_budget
+    if (
+        type(source) is not _PinnedSource
+        or type(read) is not _PinnedReadBudget
+        or source.budget is not read
+        or type(source.identity) is not tuple
+        or len(source.identity) != 5
+        or any(type(value) is not int for value in source.identity)
+        or acquisition.source_identity is not source.identity
+        or type(acquisition.source_size) is not int
+        or acquisition.source_size != source.size
+        or type(acquisition.footer_start) is not int
+        or type(acquisition.footer_end) is not int
+        or not 4 <= acquisition.footer_start < acquisition.footer_end == source.size - 8
+        or type(acquisition.payload) is not bytes
+        or len(acquisition.payload) != acquisition.footer_end - acquisition.footer_start
+        or not _live_footer_snapshot(acquisition.receipt_before)
+        or not _live_footer_snapshot(acquisition.receipt_after)
+        or not _live_footer_snapshot((read.source_opens, read.total_read_bytes))
+        or acquisition.receipt_before[0] >= acquisition.receipt_after[0]
+        or acquisition.receipt_after[1] - acquisition.receipt_before[1]
+        != 12 + len(acquisition.payload)
+        or (read.source_opens, read.total_read_bytes) != acquisition.receipt_after
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    pages = acquisition.page_budget
+    if pages is None:
+        if acquisition.wire_budget is not None:
+            raise PinnedReadRefused("invalid_contract")
+    elif (
+        type(pages) is not _PageBudget
+        or pages.read_budget is not read
+        or type(acquisition.wire_budget) is not _CompactWireBudget
+        or pages.wire_budget is not acquisition.wire_budget
+    ):
+        raise PinnedReadRefused("invalid_contract")
+
+
+def _live_footer_read(
+    source: _PinnedSource, offset: int, length: int, pages: _PageBudget | None
+) -> bytes:
+    from liq.store.timestamp_metadata import _PinnedSource, _read_pinned_range
+
+    if (
+        type(source) is not _PinnedSource
+        or source._closed
+        or type(source.budget) is not _PinnedReadBudget
+        or type(offset) is not int
+        or type(length) is not int
+        or offset < 0
+        or length <= 0
+        or offset + length > source.size
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    if length > source.budget.limits.max_total_read_bytes - source.budget.total_read_bytes:
+        raise PinnedReadRefused("resource_limit")
+    if pages is not None:
+        pages.reserve(_PageCharge(allocation_bytes=length, work_units=1))
+    return _read_pinned_range(source, offset=offset, length=length)
+
+
+def _read_footer_from_source(
+    source: _PinnedSource,
+    *,
+    max_footer_bytes: int,
+    max_retained_payload_bytes: int,
+    budget: _PinnedReadBudget,
+    receipt_before: tuple[int, int],
+    page_budget: _PageBudget | None = None,
+) -> _LiveFooterAcquisition:
+    from liq.store.timestamp_metadata import TimestampMetadataRefused, _PinnedSource
+
+    if (
+        type(source) is not _PinnedSource
+        or source._closed
+        or type(budget) is not _PinnedReadBudget
+        or source.budget is not budget
+        or type(source.identity) is not tuple
+        or len(source.identity) != 5
+        or any(type(value) is not int for value in source.identity)
+        or not _live_footer_snapshot((budget.source_opens, budget.total_read_bytes))
+        or type(max_footer_bytes) is not int
+        or max_footer_bytes <= 0
+        or type(max_retained_payload_bytes) is not int
+        or max_retained_payload_bytes <= 0
+        or not _live_footer_snapshot(receipt_before)
+        or receipt_before[0] >= budget.source_opens
+        or receipt_before[1] > budget.total_read_bytes
+        or (
+            page_budget is not None
+            and (
+                type(page_budget) is not _PageBudget
+                or page_budget.read_budget is not budget
+                or type(page_budget.wire_budget) is not _CompactWireBudget
+            )
+        )
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    size = source.size
+    if size < 12:
+        raise TimestampMetadataRefused("footer envelope length")
+    if (
+        max_retained_payload_bytes < 12
+        or budget.limits.max_total_read_bytes - budget.total_read_bytes < 12
+    ):
+        raise PinnedReadRefused("resource_limit")
+    leading = _live_footer_read(source, 0, 4, page_budget)
+    if leading != b"PAR1":
+        if leading == b"PARE":
+            raise PinnedReadRefused("unsupported_mode")
+        raise TimestampMetadataRefused("footer envelope magic")
+    trailer_start = size - 8
+    trailing = _live_footer_read(source, trailer_start, 8, page_budget)
+    if not (trailing[4] == 80 and trailing[5] == 65 and trailing[6] == 82 and trailing[7] == 49):
+        if trailing[4] == 80 and trailing[5] == 65 and trailing[6] == 82 and trailing[7] == 69:
+            raise PinnedReadRefused("unsupported_mode")
+        raise TimestampMetadataRefused("footer envelope magic")
+    length = trailing[0] | (trailing[1] << 8) | (trailing[2] << 16) | (trailing[3] << 24)
+    start = trailer_start - length
+    if length == 0 or start < 4:
+        raise TimestampMetadataRefused("footer envelope length")
+    if (
+        length > max_footer_bytes
+        or length + 12 > max_retained_payload_bytes
+        or length > budget.limits.max_total_read_bytes - budget.total_read_bytes
+    ):
+        raise PinnedReadRefused("resource_limit")
+    payload = _live_footer_read(source, start, length, page_budget)
+    return _LiveFooterAcquisition(
+        source,
+        budget,
+        page_budget,
+        None if page_budget is None else page_budget.wire_budget,
+        source.identity,
+        size,
+        start,
+        trailer_start,
+        payload,
+        receipt_before,
+        (budget.source_opens, budget.total_read_bytes),
+    )
+
+
+def _footer_envelope_from_acquisition(acquisition: _LiveFooterAcquisition) -> _FooterEnvelope:
+    _live_footer_validate(acquisition)
+    extent = _FooterExtent(
+        acquisition.source_size, acquisition.footer_start, acquisition.footer_end
+    )
+    receipt = _FooterEnvelopeReceipt(
+        acquisition.receipt_before[0],
+        acquisition.receipt_after[0],
+        acquisition.receipt_before[1],
+        acquisition.receipt_after[1],
+        (
+            (0, 4),
+            (acquisition.footer_end, acquisition.source_size),
+            (acquisition.footer_start, acquisition.footer_end),
+        ),
+        False,
+    )
+    return _FooterEnvelope(
+        acquisition.payload, extent, acquisition.source_identity, receipt, acquisition.read_budget
+    )
+
+
+def _admit_owned_initial_page_header(
+    acquisition: _LiveFooterAcquisition,
+    envelope: _FooterEnvelope,
+    profile: _FooterProfile,
+    *,
+    row_group_index: int,
+    column_index: int,
+    budget: _PageBudget,
+) -> _OwnedPageHeaderAdmission:
+    from liq.store.timestamp_metadata import _read_pinned_range
+
+    _live_footer_validate(acquisition)
+    if (
+        acquisition.source._closed
+        or type(envelope) is not _FooterEnvelope
+        or type(envelope.extent) is not _FooterExtent
+        or type(envelope.receipt) is not _FooterEnvelopeReceipt
+        or envelope.payload is not acquisition.payload
+        or envelope.source_identity is not acquisition.source_identity
+        or envelope.read_budget is not acquisition.read_budget
+        or type(profile) is not _FooterProfile
+        or type(profile.document) is not _FooterDocument
+        or profile.document.payload is not envelope.payload
+        or profile.document.extent is not envelope.extent
+        or type(profile.document.budget) is not _FooterBudget
+        or type(budget) is not _PageBudget
+        or budget is not acquisition.page_budget
+        or budget.read_budget is not acquisition.read_budget
+        or budget.wire_budget is not acquisition.wire_budget
+        or profile.document.budget.wire_budget is not acquisition.wire_budget
+        or type(row_group_index) is not int
+        or row_group_index < 0
+        or type(column_index) is not int
+        or column_index < 0
+        or type(profile.chunks) is not tuple
+        or type(profile.leaves) is not tuple
+        or len(profile.chunks) > profile.document.budget.limits.max_total_column_chunks
+        or len(profile.leaves) > profile.document.budget.limits.max_leaf_columns
+        or envelope.extent.source_size != acquisition.source_size
+        or envelope.extent.footer_start != acquisition.footer_start
+        or envelope.extent.footer_end != acquisition.footer_end
+        or envelope.receipt.whole_source_digest_verified is not False
+        or (envelope.receipt.source_opens_before, envelope.receipt.total_read_bytes_before)
+        != acquisition.receipt_before
+        or (envelope.receipt.source_opens_after, envelope.receipt.total_read_bytes_after)
+        != acquisition.receipt_after
+        or envelope.receipt.ranges
+        != (
+            (0, 4),
+            (acquisition.footer_end, acquisition.source_size),
+            (acquisition.footer_start, acquisition.footer_end),
+        )
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    _owned_header_flags(profile.flags)
+    _page_work(budget)
+    chunk: _FooterChunkProfile | None = None
+    for candidate in profile.chunks:
+        _page_work(budget)
+        if (
+            type(candidate) is not _FooterChunkProfile
+            or type(candidate.row_group_index) is not int
+            or candidate.row_group_index < 0
+            or type(candidate.column_index) is not int
+            or candidate.column_index < 0
+        ):
+            raise PinnedReadRefused("invalid_contract")
+        if candidate.row_group_index == row_group_index and candidate.column_index == column_index:
+            if chunk is not None:
+                raise PinnedReadRefused("invalid_contract")
+            chunk = candidate
+    if chunk is None:
+        raise PinnedReadRefused("invalid_contract")
+    if chunk.schema_index is None:
+        raise PinnedReadRefused("unsupported_mode")
+    if type(chunk.schema_index) is not int or chunk.schema_index < 0:
+        raise PinnedReadRefused("invalid_contract")
+    leaf: _FooterLeafProfile | None = None
+    for candidate_leaf in profile.leaves:
+        _page_work(budget)
+        if (
+            type(candidate_leaf) is not _FooterLeafProfile
+            or type(candidate_leaf.schema_index) is not int
+            or candidate_leaf.schema_index < 0
+        ):
+            raise PinnedReadRefused("invalid_contract")
+        if candidate_leaf.schema_index == chunk.schema_index:
+            if leaf is not None:
+                raise PinnedReadRefused("invalid_contract")
+            leaf = candidate_leaf
+    if leaf is None:
+        raise PinnedReadRefused("invalid_contract")
+    _owned_header_flags(chunk.flags)
+    _owned_header_flags(leaf.flags)
+    _page_work(budget)
+    _owned_header_policy(profile, chunk, leaf)
+    extent = chunk.candidate_extent
+    if extent is None:
+        raise PinnedReadRefused("unsupported_mode")
+    if (
+        type(extent) is not tuple
+        or len(extent) != 2
+        or any(type(value) is not int for value in extent)
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    origin, stop = extent
+    if origin == stop:
+        raise PinnedReadRefused("invalid_contract")
+    if not 4 <= origin < stop <= acquisition.footer_start:
+        raise PinnedReadRefused("unsupported_mode")
+    dictionary = chunk.dictionary_page_offset
+    if dictionary is not None:
+        if (
+            type(dictionary) is not int
+            or dictionary != origin
+            or chunk.data_page_offset is None
+            or not dictionary < chunk.data_page_offset < stop
+        ):
+            raise PinnedReadRefused("unsupported_mode")
+    elif chunk.data_page_offset != origin:
+        raise PinnedReadRefused("unsupported_mode")
+
+    def fetch(offset: int, length: int) -> bytes:
+        if (
+            type(offset) is not int
+            or type(length) is not int
+            or offset < 0
+            or length <= 0
+            or offset + length > stop - origin
+        ):
+            raise PinnedReadRefused("invalid_contract")
+        return _read_pinned_range(acquisition.source, offset=origin + offset, length=length)
+
+    cursor = _CompactWireCursor(
+        b"",
+        0,
+        stop - origin,
+        budget.wire_budget,
+        kind="page_header",
+        fetch=fetch,
+        page_budget=budget,
+    )
+    admission = _admit_page_header(cursor, chunk_remaining_bytes=stop - origin, budget=budget)
+    if (
+        admission.header_start != 0
+        or not 0
+        < admission.header_end
+        == admission.body_start
+        <= admission.body_end
+        <= stop - origin
+        or (
+            admission.page_type != 2
+            if dictionary is not None
+            else admission.page_type not in (0, 3)
+        )
+    ):
+        raise _CompactWireMalformed("schema_mismatch")
+    _page_work(budget)
+    return _OwnedPageHeaderAdmission(acquisition, envelope, profile, chunk, leaf, origin, admission)
+
+
+def _owned_header_flags(value: frozenset[_FooterCapability]) -> None:
+    known = (
+        "root_repetition_present",
+        "primitive_child_count_present",
+        "row_group_ordinal_interpretation_unresolved",
+        "unresolved_schema_tree",
+        "ambiguous_projection_name",
+        "unresolved_logical_compatibility",
+        "external_column_reference",
+        "plaintext_column_metadata_absent",
+        "encrypted_column_metadata_present",
+        "column_encryption_present",
+        "footer_encryption_present",
+        "footer_signing_metadata_present",
+        "arrow_schema_metadata_present",
+        "arrow_extension_metadata_present",
+        "opaque_metadata_present",
+        "unbounded_bloom_extent",
+        "legacy_index_page_reference",
+        "unrecognized_file_version",
+        "unresolved_extent_interpretation",
+        "page_profile_unverified",
+        "native_conversion_unproved",
+        "source_binding_unproved",
+        "utc_value_gate_unproved",
+    )
+    if (
+        type(value) is not frozenset
+        or len(value) > len(known)
+        or any(type(flag) is not str or flag not in known for flag in value)
+    ):
+        raise PinnedReadRefused("invalid_contract")
+
+
+def _owned_header_policy(
+    profile: _FooterProfile, chunk: _FooterChunkProfile, leaf: _FooterLeafProfile
+) -> None:
+    global_blockers = (
+        "unresolved_schema_tree",
+        "footer_encryption_present",
+        "footer_signing_metadata_present",
+        "unrecognized_file_version",
+        "unresolved_extent_interpretation",
+    )
+    selected_blockers = (
+        "primitive_child_count_present",
+        "unresolved_schema_tree",
+        "ambiguous_projection_name",
+        "external_column_reference",
+        "plaintext_column_metadata_absent",
+        "encrypted_column_metadata_present",
+        "column_encryption_present",
+        "unbounded_bloom_extent",
+        "legacy_index_page_reference",
+        "unresolved_extent_interpretation",
+    )
+    if any(flag in profile.flags for flag in global_blockers) or any(
+        flag in chunk.flags or flag in leaf.flags for flag in selected_blockers
+    ):
+        raise PinnedReadRefused("unsupported_mode")
+    if (
+        type(chunk.physical_type) is not int
+        or type(leaf.physical_type) is not int
+        or chunk.physical_type != leaf.physical_type
+        or type(chunk.codec) is not int
+        or chunk.codec < 0
+        or type(chunk.num_values) is not int
+        or chunk.num_values < 0
+        or type(chunk.compressed_size) is not int
+        or chunk.compressed_size < 0
+        or type(chunk.uncompressed_size) is not int
+        or chunk.uncompressed_size < 0
+        or type(chunk.row_group_rows) is not int
+        or chunk.row_group_rows < 0
+        or type(chunk.data_page_offset) is not int
+        or chunk.data_page_offset < 4
+        or type(leaf.definition_depth) is not int
+        or type(leaf.repetition_depth) is not int
+        or not 0 <= leaf.repetition_depth <= leaf.definition_depth
+        or type(leaf.path) is not tuple
+        or not leaf.path
+        or type(chunk.encodings) is not tuple
+        or not chunk.encodings
+    ):
+        raise PinnedReadRefused("unsupported_mode")
+    if (
+        len(leaf.path) > profile.document.budget.limits.max_schema_depth
+        or len(chunk.encodings) > profile.document.budget.wire_budget.limits.max_items_per_container
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    if any(type(value) is not int or value < 0 for value in chunk.encodings):
+        raise PinnedReadRefused("unsupported_mode")
+    for span in leaf.path:
+        if (
+            type(span) is not _FooterSpan
+            or type(span.start) is not int
+            or type(span.end) is not int
+            or not 0 <= span.start <= span.end <= len(profile.document.payload)
+        ):
+            raise PinnedReadRefused("unsupported_mode")
