@@ -90,6 +90,9 @@ class PinnedReadLimits:
                 raise PinnedReadRefused("invalid_contract")
 
 
+_PINNED_READ_CHUNK_BYTES = 1024 * 1024
+
+
 class _PinnedReadBudget:
     """Per-invocation mutable accounting alongside immutable read limits."""
 
@@ -115,7 +118,7 @@ class _PinnedReadBudget:
         available = self.limits.max_total_read_bytes - self.total_read_bytes
         if available <= 0:
             raise PinnedReadRefused("resource_limit")
-        return min(remaining_bytes, available, 1024 * 1024)
+        return min(remaining_bytes, available, _PINNED_READ_CHUNK_BYTES)
 
     def record_read(self, actual_bytes: int) -> None:
         if type(actual_bytes) is not int or actual_bytes < 0:
@@ -3399,6 +3402,7 @@ class _OwnedPageHeaderAdmission:
     leaf: _FooterLeafProfile
     page_origin: int
     admission: _PageHeaderAdmission
+    body_entry_work_units: int
 
     @property
     def absolute_header_span(self) -> tuple[int, int]:
@@ -3423,10 +3427,148 @@ def _live_footer_snapshot(value: tuple[int, int]) -> bool:
     )
 
 
-def _live_footer_validate(acquisition: _LiveFooterAcquisition) -> None:
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class _OwnedPageBody:
+    header: _OwnedPageHeaderAdmission
+    payload: bytes
+    receipt_after: tuple[int, int]
+    crc_verified: bool
+
+
+def _read_owned_initial_page_body(
+    header: _OwnedPageHeaderAdmission, *, budget: _PageBudget
+) -> _OwnedPageBody:
+    from liq.store.timestamp_metadata import _read_pinned_range
+
+    if (
+        type(header) is not _OwnedPageHeaderAdmission
+        or type(header.acquisition) is not _LiveFooterAcquisition
+        or type(header.admission) is not _PageHeaderAdmission
+        or type(budget) is not _PageBudget
+        or budget is not header.acquisition.page_budget
+        or not _live_footer_snapshot(header.acquisition.receipt_after)
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    acquisition = header.acquisition
+    admission = header.admission
+    if (
+        any(
+            type(value) is not int
+            for value in (
+                header.page_origin,
+                header.body_entry_work_units,
+                admission.header_start,
+                admission.header_end,
+                admission.body_start,
+                admission.body_end,
+                admission.compressed_page_size,
+            )
+        )
+        or header.body_entry_work_units < 0
+        or header.body_entry_work_units != budget.work_units
+        or admission.header_start != 0
+        or not 0 < admission.header_end == admission.body_start
+        or admission.compressed_page_size < 0
+        or admission.body_end - admission.body_start != admission.compressed_page_size
+        or admission.decode_eligible is not False
+        or (
+            admission.crc is not None
+            and (type(admission.crc) is not int or not -(1 << 31) <= admission.crc < (1 << 31))
+        )
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    expected = (
+        acquisition.receipt_after[0],
+        acquisition.receipt_after[1] + admission.header_end - admission.header_start,
+    )
+    _live_footer_validate(acquisition, expected_current_receipt=expected)
+    envelope = header.envelope
+    profile = header.profile
+    chunk = header.chunk
+    leaf = header.leaf
+    if (
+        acquisition.source._closed
+        or type(envelope) is not _FooterEnvelope
+        or type(envelope.extent) is not _FooterExtent
+        or type(envelope.receipt) is not _FooterEnvelopeReceipt
+        or envelope.payload is not acquisition.payload
+        or envelope.source_identity is not acquisition.source_identity
+        or envelope.read_budget is not acquisition.read_budget
+        or envelope.extent.source_size != acquisition.source_size
+        or envelope.extent.footer_start != acquisition.footer_start
+        or envelope.extent.footer_end != acquisition.footer_end
+        or envelope.receipt.whole_source_digest_verified is not False
+        or (envelope.receipt.source_opens_before, envelope.receipt.total_read_bytes_before)
+        != acquisition.receipt_before
+        or (envelope.receipt.source_opens_after, envelope.receipt.total_read_bytes_after)
+        != acquisition.receipt_after
+        or envelope.receipt.ranges
+        != (
+            (0, 4),
+            (acquisition.footer_end, acquisition.source_size),
+            (acquisition.footer_start, acquisition.footer_end),
+        )
+        or type(profile) is not _FooterProfile
+        or type(profile.document) is not _FooterDocument
+        or profile.document.payload is not envelope.payload
+        or profile.document.extent is not envelope.extent
+        or type(profile.document.budget) is not _FooterBudget
+        or profile.document.budget.wire_budget is not acquisition.wire_budget
+        or profile.read_eligible is not False
+        or type(profile.chunks) is not tuple
+        or type(profile.leaves) is not tuple
+        or not profile.chunks
+        or len(profile.chunks) > profile.document.budget.limits.max_total_column_chunks
+        or len(profile.leaves) > profile.document.budget.limits.max_leaf_columns
+        or type(chunk) is not _FooterChunkProfile
+        or type(leaf) is not _FooterLeafProfile
+        or type(leaf.leaf_ordinal) is not int
+        or not 0 <= leaf.leaf_ordinal < len(profile.leaves)
+        or profile.leaves[leaf.leaf_ordinal] is not leaf
+        or chunk.schema_index != leaf.schema_index
+        or chunk.physical_type != leaf.physical_type
+        or type(chunk.candidate_extent) is not tuple
+        or len(chunk.candidate_extent) != 2
+        or any(type(value) is not int for value in chunk.candidate_extent)
+        or not 4 <= header.page_origin == chunk.candidate_extent[0]
+        or not header.page_origin + admission.body_end
+        <= chunk.candidate_extent[1]
+        <= acquisition.footer_start
+    ):
+        raise PinnedReadRefused("invalid_contract")
+    read = acquisition.read_budget
+    size = admission.compressed_page_size
+    if size > read.limits.max_total_read_bytes - read.total_read_bytes:
+        raise PinnedReadRefused("resource_limit")
+    budget.reserve(_PageCharge(allocation_bytes=2 * size, work_units=1))
+    parts: list[bytes] = []
+    start, stop = header.absolute_body_span
+    position = start
+    while position < stop:
+        length = min(stop - position, _PINNED_READ_CHUNK_BYTES)
+        _page_work(budget)
+        parts.append(_read_pinned_range(acquisition.source, offset=position, length=length))
+        position += length
+    _page_work(budget)
+    payload = b"".join(parts)
+    _verify_page_crc(payload, start=0, stop=size, crc=admission.crc, budget=budget)
+    _page_work(budget)
+    receipt = (read.source_opens, read.total_read_bytes)
+    if receipt != (expected[0], expected[1] + size):
+        raise PinnedReadRefused("invalid_contract")
+    return _OwnedPageBody(header, payload, receipt, admission.crc is not None)
+
+
+def _live_footer_validate(
+    acquisition: _LiveFooterAcquisition,
+    *,
+    expected_current_receipt: tuple[int, int] | None = None,
+) -> None:
     from liq.store.timestamp_metadata import _PinnedSource
 
-    if type(acquisition) is not _LiveFooterAcquisition:
+    if type(acquisition) is not _LiveFooterAcquisition or (
+        expected_current_receipt is not None and not _live_footer_snapshot(expected_current_receipt)
+    ):
         raise PinnedReadRefused("invalid_contract")
     source = acquisition.source
     read = acquisition.read_budget
@@ -3451,7 +3593,12 @@ def _live_footer_validate(acquisition: _LiveFooterAcquisition) -> None:
         or acquisition.receipt_before[0] >= acquisition.receipt_after[0]
         or acquisition.receipt_after[1] - acquisition.receipt_before[1]
         != 12 + len(acquisition.payload)
-        or (read.source_opens, read.total_read_bytes) != acquisition.receipt_after
+        or (read.source_opens, read.total_read_bytes)
+        != (
+            acquisition.receipt_after
+            if expected_current_receipt is None
+            else expected_current_receipt
+        )
     ):
         raise PinnedReadRefused("invalid_contract")
     pages = acquisition.page_budget
@@ -3752,7 +3899,9 @@ def _admit_owned_initial_page_header(
     ):
         raise _CompactWireMalformed("schema_mismatch")
     _page_work(budget)
-    return _OwnedPageHeaderAdmission(acquisition, envelope, profile, chunk, leaf, origin, admission)
+    return _OwnedPageHeaderAdmission(
+        acquisition, envelope, profile, chunk, leaf, origin, admission, budget.work_units
+    )
 
 
 def _owned_header_flags(value: frozenset[_FooterCapability]) -> None:

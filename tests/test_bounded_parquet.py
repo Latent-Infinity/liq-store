@@ -9840,3 +9840,536 @@ class LiveSourceHeaderTests(unittest.TestCase):
                         {axis: getattr(env.ledgers.page, axis) for axis in PageBudgetTests.axes},
                         axes | {"work_units": axes["work_units"] + 4},
                     )
+
+
+class OwnedPageBodyTests(unittest.TestCase):
+    """Opaque byte-protocol ownership; these bytes do not represent market observations."""
+
+    def fixture(self, payload=b"\x00" * 7, *, crc=None, kind=0, codec=0):
+        footer_api = FooterProfileTests()
+        header_api = PageHeaderAdmissionTests()
+        count = 3 if payload else 0
+        if kind == 2:
+            detail = ((1, "i32", _grammar_integer(2)), (2, "i32", _grammar_integer(0)))
+        elif kind == 3:
+            detail = tuple(
+                (field, "i32", _grammar_integer(value))
+                for field, value in ((1, count), (2, 0), (3, count), (4, 0), (5, 0), (6, 0))
+            )
+        else:
+            detail = tuple(
+                (field, "i32", _grammar_integer(value))
+                for field, value in ((1, count), (2, 0), (3, 3), (4, 3))
+            )
+        header = header_api.wire(
+            kind, detail=detail, compressed=len(payload), uncompressed=len(payload), crc=crc
+        )
+        segment = header + payload
+        data_origin = 64
+        extra = ()
+        if kind == 2:
+            data_origin += len(segment)
+            extra = ((11, "i64", _grammar_integer(64)),)
+            segment += header_api.wire(0, compressed=7, uncompressed=7) + b"\x00" * 7
+        metadata = footer_api.meta(
+            path=(b"n",),
+            values=count,
+            data=data_origin,
+            compressed=len(segment),
+            uncompressed=len(segment),
+            encodings=(0, 3),
+            codec=codec,
+            extra=extra,
+        )
+        footer = footer_api.payload(
+            (footer_api.root(1), footer_api.node(b"n")),
+            (footer_api.group((footer_api.chunk(metadata),), rows=count, size=len(segment)),),
+            rows=count,
+        )
+        prefix = b"PAR1" + b"\x00" * 60 + segment
+        return SimpleNamespace(
+            payload=prefix + footer + len(footer).to_bytes(4, "little") + b"PAR1",
+            footer=footer,
+            header=header,
+            origin=64,
+            body_size=len(payload),
+            body=payload,
+            footer_start=len(prefix),
+            dictionary=kind == 2,
+            expected_flags=(),
+        )
+
+    def environment(self, *args, **kwargs):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def opened():
+            case = self.fixture(*args, **kwargs)
+            helper = LiveSourceHeaderTests()
+            with helper.io_for(case.payload) as io:
+                ledgers = helper.budgets(io)
+                before = (ledgers.read.source_opens, ledgers.read.total_read_bytes)
+                with FooterEnvelopeTests().owner(io, ledgers.read) as source:
+                    acquisition = helper.acquire(io, source, ledgers, before)
+                    envelope = helper.api()._footer_envelope_from_acquisition(acquisition)
+                    profile = bounded_parquet._profile_footer_envelope(
+                        envelope, budget=ledgers.footer
+                    )
+                    yield SimpleNamespace(
+                        io=io,
+                        case=case,
+                        ledgers=ledgers,
+                        source=source,
+                        acquisition=acquisition,
+                        envelope=envelope,
+                        profile=profile,
+                    )
+            self.assertCountEqual(io.close_attempts, io.acquired)
+
+        return opened()
+
+    def admit(self, env):
+        return LiveSourceHeaderTests().admit(env)
+
+    def body(self, env, header, *, budget=None):
+        return bounded_parquet._read_owned_initial_page_body(
+            header, budget=env.ledgers.page if budget is None else budget
+        )
+
+    def counters(self, env):
+        return SimpleNamespace(
+            read=(env.ledgers.read.source_opens, env.ledgers.read.total_read_bytes),
+            closes=tuple(env.io.close_attempts),
+            page={axis: getattr(env.ledgers.page, axis) for axis in PageBudgetTests.axes},
+            wire=tuple(
+                getattr(env.ledgers.wire, axis)
+                for axis in (
+                    "total_wire_bytes",
+                    "work_units",
+                    "total_fields",
+                    "total_items",
+                    "total_string_bytes",
+                    "copied_payload_bytes",
+                )
+            ),
+            requests=tuple(env.io.positional_requests),
+            events=tuple(env.io.events),
+        )
+
+    def assert_quiet_refusal(self, env, header, *, budget=None):
+        before = self.counters(env)
+        with self.assertRaises(PinnedReadRefused) as caught:
+            self.body(env, header, budget=budget)
+        self.assertEqual(caught.exception.reason_code, "invalid_contract")
+        self.assertEqual(self.counters(env).__dict__, before.__dict__)
+
+    def assert_body_delta(self, env, before, *, size, work):
+        after = self.counters(env)
+        self.assertEqual(after.read, (before.read[0], before.read[1] + size))
+        self.assertEqual(after.wire, before.wire)
+        self.assertEqual(
+            after.page,
+            before.page
+            | {
+                "allocation_bytes": before.page["allocation_bytes"] + 2 * env.case.body_size,
+                "work_units": before.page["work_units"] + work,
+            },
+        )
+
+    def test_exact_body_ranges_and_ledgers_for_initial_header_variants(self):
+        for kind, codec in ((0, 0), (2, 0), (3, 0), (0, 1)):
+            with (
+                self.subTest(kind=kind, codec=codec),
+                self.environment(kind=kind, codec=codec) as env,
+            ):
+                header = self.admit(env)
+                self.assertFalse(header.admission.decode_eligible)
+                self.assertEqual(header.chunk.codec, codec)
+                before = self.counters(env)
+                self.assertEqual(
+                    before.read,
+                    (len(env.io.acquired), len(env.case.footer) + 12 + len(env.case.header)),
+                )
+                self.assertEqual(header.body_entry_work_units, before.page["work_units"])
+                result = self.body(env, header)
+                self.assertIsInstance(result, bounded_parquet._OwnedPageBody)
+                self.assertIs(result.header, header)
+                self.assertEqual(result.payload, b"\x00" * 7)
+                self.assertFalse(result.crc_verified)
+                self.assertEqual(result.receipt_after, (before.read[0], before.read[1] + 7))
+                start = 64 + len(env.case.header)
+                self.assertEqual(header.absolute_body_span, (start, start + 7))
+                self.assertEqual(
+                    [request[1:] for request in env.io.positional_requests[len(before.requests) :]],
+                    [(7, start)],
+                )
+                self.assertEqual(tuple(env.io.close_attempts), before.closes)
+                self.assertNotIn(env.source.borrow_fd(), env.io.close_attempts)
+                self.assertFalse(env.source._closed)
+                self.assertFalse(env.profile.read_eligible)
+                self.assertFalse(header.admission.decode_eligible)
+                self.assertFalse(env.envelope.receipt.whole_source_digest_verified)
+                self.assert_body_delta(env, before, size=7, work=6)
+                with self.assertRaises(FrozenInstanceError):
+                    result.payload = b"replacement"
+                self.assert_quiet_refusal(env, header)
+
+    def test_crc_absence_empty_zero_and_signed_known_vector(self):
+        vectors = ((b"", None, False, 5), (b"", 0, True, 5), (b"123456789", -873187034, True, 87))
+        for payload, crc, verified, work in vectors:
+            with self.subTest(payload=payload, crc=crc), self.environment(payload, crc=crc) as env:
+                header = self.admit(env)
+                before = self.counters(env)
+                result = self.body(env, header)
+                self.assertEqual(result.payload, payload)
+                self.assertIs(result.crc_verified, verified)
+                self.assert_body_delta(env, before, size=len(payload), work=work)
+                if not payload:
+                    self.assertEqual(tuple(env.io.positional_requests), before.requests)
+                self.assert_quiet_refusal(env, header)
+
+    def test_crc_mismatch_retains_acquisition_and_scalar_work_without_result(self):
+        with self.environment(b"123456789", crc=0) as env:
+            header = self.admit(env)
+            before = self.counters(env)
+            with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+                self.body(env, header)
+            self.assertEqual(caught.exception.reason_code, "invalid_wire")
+            self.assert_body_delta(env, before, size=9, work=86)
+            self.assert_quiet_refusal(env, header)
+
+    def test_stage_and_geometry_drift_refuse_before_clock_or_io(self):
+        faults = (
+            "read_bytes",
+            "opens",
+            "work",
+            "wire",
+            "closed",
+            "origin",
+            "span",
+            "stamp",
+            "source",
+            "identity",
+            "read_budget",
+            "profile",
+            "leaf",
+        )
+        for fault in faults:
+            with self.subTest(fault=fault), self.environment() as env:
+                header = self.admit(env)
+                undo = None
+                if fault == "read_bytes":
+                    env.io.module._read_pinned_range(env.source, offset=0, length=1)
+                elif fault == "opens":
+                    env.ledgers.read.source_opens += 1
+                elif fault == "work":
+                    env.ledgers.page.reserve(bounded_parquet._PageCharge(work_units=1))
+                elif fault == "wire":
+                    original = env.ledgers.page.wire_budget
+                    env.ledgers.page.wire_budget = FooterGrammarTests().wire_budget()
+
+                    def undo(env=env, original=original):
+                        env.ledgers.page.wire_budget = original
+                elif fault == "closed":
+                    env.source._closed = True
+
+                    def undo(env=env):
+                        env.source._closed = False
+                elif fault == "origin":
+                    header = replace(header, page_origin=header.page_origin + 1)
+                elif fault == "span":
+                    header = replace(
+                        header,
+                        admission=replace(header.admission, body_end=header.admission.body_end + 1),
+                    )
+                elif fault == "stamp":
+                    header = replace(header, body_entry_work_units=True)
+                elif fault == "source":
+                    header = replace(
+                        header, acquisition=replace(header.acquisition, source=object())
+                    )
+                elif fault == "identity":
+                    identity = header.acquisition.source_identity
+                    header = replace(
+                        header,
+                        acquisition=replace(
+                            header.acquisition, source_identity=(99, *identity[1:])
+                        ),
+                    )
+                elif fault == "read_budget":
+                    header = replace(
+                        header,
+                        acquisition=replace(
+                            header.acquisition, read_budget=PageBudgetTests().budget().read_budget
+                        ),
+                    )
+                elif fault == "profile":
+                    header = replace(header, profile=replace(header.profile, chunks=()))
+                else:
+                    header = replace(header, leaf=replace(header.leaf, path=(b"other",)))
+                try:
+                    self.assert_quiet_refusal(env, header)
+                finally:
+                    if undo is not None:
+                        undo()
+
+    def test_foreign_budget_and_closed_source_cannot_acquire_or_reopen(self):
+        with self.environment() as env:
+            header = self.admit(env)
+            self.assert_quiet_refusal(env, header, budget=PageBudgetTests().budget())
+            self.assert_quiet_refusal(env, None)
+        self.assert_quiet_refusal(env, header)
+
+    def test_whole_read_allowance_is_checked_without_consuming_header_stage(self):
+        with self.environment() as env:
+            header = self.admit(env)
+            before = self.counters(env)
+            env.ledgers.read.limits = replace(
+                env.ledgers.read.limits, max_total_read_bytes=before.read[1] + 6
+            )
+            with self.assertRaises(PinnedReadRefused) as caught:
+                self.body(env, header)
+            self.assertEqual(caught.exception.reason_code, "resource_limit")
+            self.assertEqual(self.counters(env).__dict__, before.__dict__)
+
+    def test_allocation_reservation_is_atomic_and_visible_at_actual_range_boundary(self):
+        for allowance in (13, 14):
+            with self.subTest(allowance=allowance), self.environment() as env:
+                header = self.admit(env)
+                before = self.counters(env)
+                env.ledgers.page.limits = replace(
+                    env.ledgers.page.limits,
+                    max_allocation_bytes=before.page["allocation_bytes"] + allowance,
+                )
+                actual = env.io.module._read_pinned_range
+                observations = []
+
+                def observed(
+                    source, *, offset, length, env=env, actual=actual, observations=observations
+                ):
+                    self.assertIs(source, env.source)
+                    observations.append(
+                        (env.ledgers.page.allocation_bytes, env.ledgers.page.work_units)
+                    )
+                    return actual(source, offset=offset, length=length)
+
+                with patch.object(env.io.module, "_read_pinned_range", side_effect=observed):
+                    if allowance == 13:
+                        with self.assertRaises(PinnedReadRefused) as caught:
+                            self.body(env, header)
+                        self.assertEqual(caught.exception.reason_code, "resource_limit")
+                        self.assertEqual(observations, [])
+                        self.assertEqual(self.counters(env).page, before.page)
+                        self.assertEqual(tuple(env.io.positional_requests), before.requests)
+                    else:
+                        self.body(env, header)
+                        self.assertEqual(
+                            observations,
+                            [
+                                (
+                                    before.page["allocation_bytes"] + 14,
+                                    before.page["work_units"] + 2,
+                                )
+                            ],
+                        )
+
+    def test_segment_ceiling_and_clock_count_use_one_actual_range_check(self):
+        cap = 1024 * 1024
+        cases = ((cap, ((cap, 0),), 6, 8), (cap + 1, ((cap, 0), (1, cap)), 7, 11))
+        for size, relative_ranges, work, clocks in cases:
+            with self.subTest(size=size), self.environment(b"n" * size) as env:
+                header = self.admit(env)
+                before = self.counters(env)
+                result = self.body(env, header)
+                self.assertEqual(result.payload, env.case.body)
+                start = 64 + len(env.case.header)
+                self.assertEqual(
+                    [request[1:] for request in env.io.positional_requests[len(before.requests) :]],
+                    [(length, start + offset) for length, offset in relative_ranges],
+                )
+                self.assert_body_delta(env, before, size=size, work=work)
+                self.assertEqual(env.io.events[len(before.events) :].count("clock"), clocks)
+
+    def test_existing_read_sizing_retains_its_cap_and_one_deadline_check(self):
+        with self.environment() as env:
+            for requested, expected in (
+                (1, 1),
+                (1024 * 1024, 1024 * 1024),
+                (1024 * 1024 + 1, 1024 * 1024),
+            ):
+                with self.subTest(requested=requested):
+                    before = self.counters(env)
+                    self.assertEqual(env.ledgers.read.before_read(requested), expected)
+                    after = self.counters(env)
+                    self.assertEqual(after.read, before.read)
+                    self.assertEqual(after.page, before.page)
+                    self.assertEqual(after.wire, before.wire)
+                    self.assertEqual(after.requests, before.requests)
+                    self.assertEqual(after.events, before.events + ("clock",))
+
+    def test_work_refusals_keep_the_exact_completed_prefix(self):
+        for allowance in range(6):
+            with self.subTest(allowance=allowance), self.environment() as env:
+                header = self.admit(env)
+                before = self.counters(env)
+                env.ledgers.page.limits = replace(
+                    env.ledgers.page.limits,
+                    max_work_units=before.page["work_units"] + allowance,
+                )
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    self.body(env, header)
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                if allowance == 0:
+                    self.assertEqual(self.counters(env).page, before.page)
+                    self.assertEqual(tuple(env.io.positional_requests), before.requests)
+                else:
+                    self.assert_body_delta(
+                        env, before, size=7 if allowance >= 2 else 0, work=allowance
+                    )
+                    self.assert_quiet_refusal(env, header)
+
+    def test_short_segment_and_os_failure_retain_charges_without_retry(self):
+        for fault in ("short_first", "short_last", "os"):
+            with self.subTest(fault=fault), self.environment(b"n" * (1024 * 1024 + 1)) as env:
+                header = self.admit(env)
+                before = self.counters(env)
+                start = 64 + len(env.case.header)
+                if fault == "short_first":
+                    env.io.responses[(start, 1024 * 1024)] = b"n"
+                elif fault == "short_last":
+                    env.io.responses[(start + 1024 * 1024, 1)] = b""
+                else:
+                    env.io.fail_pread = len(before.requests) + 1
+                with self.assertRaises((env.io.module.TimestampMetadataRefused, OSError)):
+                    self.body(env, header)
+                read_bytes = {"short_first": 1, "short_last": 1024 * 1024, "os": 0}[fault]
+                work = 3 if fault == "short_last" else 2
+                self.assert_body_delta(env, before, size=read_bytes, work=work)
+                self.assertEqual(len(env.io.positional_requests) - len(before.requests), work - 1)
+                self.assert_quiet_refusal(env, header)
+
+    def test_entry_and_postread_deadlines_do_not_publish_or_refund(self):
+        for fault in ("entry", "postread"):
+            with self.subTest(fault=fault), self.environment() as env:
+                header = self.admit(env)
+                before = self.counters(env)
+                if fault == "entry":
+                    env.io.expired = True
+                else:
+                    env.io.expire_after = f"pread:{len(before.requests) + 1}"
+                try:
+                    with self.assertRaises(PinnedReadRefused) as caught:
+                        self.body(env, header)
+                    self.assertEqual(caught.exception.reason_code, "deadline_exceeded")
+                    if fault == "entry":
+                        self.assertEqual(self.counters(env).page, before.page)
+                        self.assertEqual(tuple(env.io.positional_requests), before.requests)
+                    else:
+                        self.assert_body_delta(env, before, size=7, work=2)
+                finally:
+                    env.io.expired = False
+
+    def test_owner_cleanup_and_final_identity_prevent_outer_publication(self):
+        for fault in ("identity", "close"):
+            published = []
+            with self.subTest(fault=fault):
+                with self.assertRaises((OSError, StorageError)):
+                    with self.environment() as env:
+                        header = self.admit(env)
+                        result = self.body(env, header)
+                        if fault == "identity":
+                            env.io.after = env.io.metadata(st_ino=99)
+                        else:
+                            env.io.close_errors[env.io.acquired[-1]] = OSError("neutral cleanup")
+                    published.append(result)
+                self.assertEqual(published, [])
+                self.assertCountEqual(env.io.close_attempts, env.io.acquired)
+
+    def test_primary_crc_refusal_retains_cleanup_error_without_publication(self):
+        close_error = OSError("neutral cleanup witness")
+        with (
+            self.assertRaises(bounded_parquet._CompactWireMalformed) as caught,
+            self.environment(b"123456789", crc=0) as env,
+        ):
+            header = self.admit(env)
+            env.io.close_errors[env.io.acquired[-1]] = close_error
+            self.body(env, header)
+        self.assertEqual(caught.exception.reason_code, "invalid_wire")
+        state = BaseException.__dict__["__dict__"].__get__(caught.exception, BaseException)
+        self.assertEqual(state[env.io.module._PINNED_CLEANUP_ERRORS], (close_error,))
+        self.assertCountEqual(env.io.close_attempts, env.io.acquired)
+
+    def test_preread_and_preassembly_deadlines_preserve_the_admitted_prefix(self):
+        for fault in ("preread", "preassembly"):
+            with self.subTest(fault=fault), self.environment() as env:
+                header = self.admit(env)
+                before = self.counters(env)
+                actual = env.io.module._read_pinned_range
+
+                def observed(source, *, offset, length, env=env, actual=actual, fault=fault):
+                    if fault == "preread":
+                        env.io.expired = True
+                    payload = actual(source, offset=offset, length=length)
+                    env.io.expired = True
+                    return payload
+
+                try:
+                    with (
+                        patch.object(env.io.module, "_read_pinned_range", side_effect=observed),
+                        self.assertRaises(PinnedReadRefused) as caught,
+                    ):
+                        self.body(env, header)
+                    self.assertEqual(caught.exception.reason_code, "deadline_exceeded")
+                    self.assert_body_delta(
+                        env, before, size=7 if fault == "preassembly" else 0, work=2
+                    )
+                finally:
+                    env.io.expired = False
+
+    def test_read_budget_invalid_and_exhausted_requests_preserve_state(self):
+        for requested, exhausted in ((0, False), (-1, False), (True, False), (1, True)):
+            with self.subTest(requested=requested, exhausted=exhausted), self.environment() as env:
+                if exhausted:
+                    env.ledgers.read.limits = replace(
+                        env.ledgers.read.limits,
+                        max_total_read_bytes=env.ledgers.read.total_read_bytes,
+                    )
+                before = self.counters(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    env.ledgers.read.before_read(requested)
+                self.assertEqual(
+                    caught.exception.reason_code,
+                    "resource_limit" if exhausted else "invalid_contract",
+                )
+                expected = before.__dict__ | {
+                    "events": before.events + (("clock",) if exhausted else ()),
+                }
+                self.assertEqual(self.counters(env).__dict__, expected)
+
+    def test_actual_foreign_read_prevents_a_successful_body_receipt(self):
+        with self.environment() as env:
+            header = self.admit(env)
+            before = self.counters(env)
+            actual = env.io.module._read_pinned_range
+
+            def observed(source, *, offset, length):
+                self.assertIs(source, env.source)
+                payload = actual(source, offset=offset, length=length)
+                self.assertEqual(actual(source, offset=0, length=1), b"P")
+                return payload
+
+            with (
+                patch.object(env.io.module, "_read_pinned_range", side_effect=observed),
+                self.assertRaises(PinnedReadRefused) as caught,
+            ):
+                self.body(env, header)
+            self.assertEqual(caught.exception.reason_code, "invalid_contract")
+            self.assert_body_delta(env, before, size=8, work=6)
+            start = 64 + len(env.case.header)
+            self.assertEqual(
+                [request[1:] for request in env.io.positional_requests[len(before.requests) :]],
+                [(7, start), (1, 0)],
+            )
+            self.assertEqual(tuple(env.io.close_attempts), before.closes)
+            self.assertFalse(env.source._closed)
+            self.assert_quiet_refusal(env, header)
