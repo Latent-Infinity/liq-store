@@ -3438,17 +3438,40 @@ class _OwnedPageBody:
 def _read_owned_initial_page_body(
     header: _OwnedPageHeaderAdmission, *, budget: _PageBudget
 ) -> _OwnedPageBody:
+    return _read_owned_page_body(header, budget=budget)
+
+
+def _read_owned_page_body(
+    header: _OwnedPageHeaderAdmission,
+    *,
+    budget: _PageBudget,
+    owner: _OwnedColumnChunk | None = None,
+) -> _OwnedPageBody:
     from liq.store.timestamp_metadata import _read_pinned_range
 
     if (
         type(header) is not _OwnedPageHeaderAdmission
         or type(header.acquisition) is not _LiveFooterAcquisition
         or type(header.admission) is not _PageHeaderAdmission
-        or type(budget) is not _PageBudget
-        or budget is not header.acquisition.page_budget
-        or not _live_footer_snapshot(header.acquisition.receipt_after)
+        or (type(budget) is not _PageBudget)
+        or (budget is not header.acquisition.page_budget)
+        or (not _live_footer_snapshot(header.acquisition.receipt_after))
     ):
         raise PinnedReadRefused("invalid_contract")
+    if owner is not None:
+        if type(owner) is not _OwnedColumnChunk:
+            raise PinnedReadRefused("invalid_contract")
+        if (
+            owner._phase != "attempted"
+            or owner._body is not None
+            or header.acquisition is not owner.acquisition
+            or (header.envelope is not owner.envelope)
+            or (header.profile is not owner.profile)
+            or (header.chunk is not owner._chunk)
+            or (header.leaf is not owner._leaf)
+            or (budget is not owner.budget)
+        ):
+            raise PinnedReadRefused("invalid_contract")
     acquisition = header.acquisition
     admission = header.admission
     if (
@@ -3466,21 +3489,19 @@ def _read_owned_initial_page_body(
         )
         or header.body_entry_work_units < 0
         or header.body_entry_work_units != budget.work_units
-        or admission.header_start != 0
-        or not 0 < admission.header_end == admission.body_start
-        or admission.compressed_page_size < 0
-        or admission.body_end - admission.body_start != admission.compressed_page_size
-        or admission.decode_eligible is not False
+        or (admission.header_start != 0)
+        or (not 0 < admission.header_end == admission.body_start)
+        or (admission.compressed_page_size < 0)
+        or (admission.body_end - admission.body_start != admission.compressed_page_size)
+        or (admission.decode_eligible is not False)
         or (
             admission.crc is not None
-            and (type(admission.crc) is not int or not -(1 << 31) <= admission.crc < (1 << 31))
+            and (type(admission.crc) is not int or not -(1 << 31) <= admission.crc < 1 << 31)
         )
     ):
         raise PinnedReadRefused("invalid_contract")
-    expected = (
-        acquisition.receipt_after[0],
-        acquisition.receipt_after[1] + admission.header_end - admission.header_start,
-    )
+    before_header = acquisition.receipt_after if owner is None else owner._receipt
+    expected = (before_header[0], before_header[1] + admission.header_end - admission.header_start)
     _live_footer_validate(acquisition, expected_current_receipt=expected)
     envelope = header.envelope
     profile = header.profile
@@ -3490,50 +3511,62 @@ def _read_owned_initial_page_body(
         acquisition.source._closed
         or type(envelope) is not _FooterEnvelope
         or type(envelope.extent) is not _FooterExtent
-        or type(envelope.receipt) is not _FooterEnvelopeReceipt
-        or envelope.payload is not acquisition.payload
-        or envelope.source_identity is not acquisition.source_identity
-        or envelope.read_budget is not acquisition.read_budget
-        or envelope.extent.source_size != acquisition.source_size
-        or envelope.extent.footer_start != acquisition.footer_start
-        or envelope.extent.footer_end != acquisition.footer_end
-        or envelope.receipt.whole_source_digest_verified is not False
-        or (envelope.receipt.source_opens_before, envelope.receipt.total_read_bytes_before)
-        != acquisition.receipt_before
-        or (envelope.receipt.source_opens_after, envelope.receipt.total_read_bytes_after)
-        != acquisition.receipt_after
-        or envelope.receipt.ranges
-        != (
-            (0, 4),
-            (acquisition.footer_end, acquisition.source_size),
-            (acquisition.footer_start, acquisition.footer_end),
+        or (type(envelope.receipt) is not _FooterEnvelopeReceipt)
+        or (envelope.payload is not acquisition.payload)
+        or (envelope.source_identity is not acquisition.source_identity)
+        or (envelope.read_budget is not acquisition.read_budget)
+        or (envelope.extent.source_size != acquisition.source_size)
+        or (envelope.extent.footer_start != acquisition.footer_start)
+        or (envelope.extent.footer_end != acquisition.footer_end)
+        or (envelope.receipt.whole_source_digest_verified is not False)
+        or (
+            (envelope.receipt.source_opens_before, envelope.receipt.total_read_bytes_before)
+            != acquisition.receipt_before
         )
-        or type(profile) is not _FooterProfile
-        or type(profile.document) is not _FooterDocument
-        or profile.document.payload is not envelope.payload
-        or profile.document.extent is not envelope.extent
-        or type(profile.document.budget) is not _FooterBudget
-        or profile.document.budget.wire_budget is not acquisition.wire_budget
-        or profile.read_eligible is not False
-        or type(profile.chunks) is not tuple
-        or type(profile.leaves) is not tuple
-        or not profile.chunks
-        or len(profile.chunks) > profile.document.budget.limits.max_total_column_chunks
-        or len(profile.leaves) > profile.document.budget.limits.max_leaf_columns
-        or type(chunk) is not _FooterChunkProfile
-        or type(leaf) is not _FooterLeafProfile
-        or type(leaf.leaf_ordinal) is not int
-        or not 0 <= leaf.leaf_ordinal < len(profile.leaves)
-        or profile.leaves[leaf.leaf_ordinal] is not leaf
-        or chunk.schema_index != leaf.schema_index
-        or chunk.physical_type != leaf.physical_type
-        or type(chunk.candidate_extent) is not tuple
-        or len(chunk.candidate_extent) != 2
+        or (
+            (envelope.receipt.source_opens_after, envelope.receipt.total_read_bytes_after)
+            != acquisition.receipt_after
+        )
+        or (
+            envelope.receipt.ranges
+            != (
+                (0, 4),
+                (acquisition.footer_end, acquisition.source_size),
+                (acquisition.footer_start, acquisition.footer_end),
+            )
+        )
+        or (type(profile) is not _FooterProfile)
+        or (type(profile.document) is not _FooterDocument)
+        or (profile.document.payload is not envelope.payload)
+        or (profile.document.extent is not envelope.extent)
+        or (type(profile.document.budget) is not _FooterBudget)
+        or (profile.document.budget.wire_budget is not acquisition.wire_budget)
+        or (profile.read_eligible is not False)
+        or (type(profile.chunks) is not tuple)
+        or (type(profile.leaves) is not tuple)
+        or (not profile.chunks)
+        or (len(profile.chunks) > profile.document.budget.limits.max_total_column_chunks)
+        or (len(profile.leaves) > profile.document.budget.limits.max_leaf_columns)
+        or (type(chunk) is not _FooterChunkProfile)
+        or (type(leaf) is not _FooterLeafProfile)
+        or (type(leaf.leaf_ordinal) is not int)
+        or (not 0 <= leaf.leaf_ordinal < len(profile.leaves))
+        or (profile.leaves[leaf.leaf_ordinal] is not leaf)
+        or (chunk.schema_index != leaf.schema_index)
+        or (chunk.physical_type != leaf.physical_type)
+        or (type(chunk.candidate_extent) is not tuple)
+        or (len(chunk.candidate_extent) != 2)
         or any(type(value) is not int for value in chunk.candidate_extent)
-        or not 4 <= header.page_origin == chunk.candidate_extent[0]
-        or not header.page_origin + admission.body_end
-        <= chunk.candidate_extent[1]
-        <= acquisition.footer_start
+        or (
+            not 4
+            <= header.page_origin
+            == (chunk.candidate_extent[0] if owner is None else owner._next)
+        )
+        or (
+            not header.page_origin + admission.body_end
+            <= chunk.candidate_extent[1]
+            <= acquisition.footer_start
+        )
     ):
         raise PinnedReadRefused("invalid_contract")
     read = acquisition.read_budget
@@ -3741,6 +3774,67 @@ def _footer_envelope_from_acquisition(acquisition: _LiveFooterAcquisition) -> _F
     )
 
 
+def _validate_owned_header_inputs(
+    acquisition: _LiveFooterAcquisition,
+    envelope: _FooterEnvelope,
+    profile: _FooterProfile,
+    *,
+    row_group_index: int,
+    column_index: int,
+    budget: _PageBudget,
+    expected_current_receipt: tuple[int, int] | None = None,
+) -> None:
+    _live_footer_validate(acquisition, expected_current_receipt=expected_current_receipt)
+    if (
+        acquisition.source._closed
+        or type(envelope) is not _FooterEnvelope
+        or type(envelope.extent) is not _FooterExtent
+        or (type(envelope.receipt) is not _FooterEnvelopeReceipt)
+        or (envelope.payload is not acquisition.payload)
+        or (envelope.source_identity is not acquisition.source_identity)
+        or (envelope.read_budget is not acquisition.read_budget)
+        or (type(profile) is not _FooterProfile)
+        or (type(profile.document) is not _FooterDocument)
+        or (profile.document.payload is not envelope.payload)
+        or (profile.document.extent is not envelope.extent)
+        or (type(profile.document.budget) is not _FooterBudget)
+        or (type(budget) is not _PageBudget)
+        or (budget is not acquisition.page_budget)
+        or (budget.read_budget is not acquisition.read_budget)
+        or (budget.wire_budget is not acquisition.wire_budget)
+        or (profile.document.budget.wire_budget is not acquisition.wire_budget)
+        or (type(row_group_index) is not int)
+        or (row_group_index < 0)
+        or (type(column_index) is not int)
+        or (column_index < 0)
+        or (type(profile.chunks) is not tuple)
+        or (type(profile.leaves) is not tuple)
+        or (len(profile.chunks) > profile.document.budget.limits.max_total_column_chunks)
+        or (len(profile.leaves) > profile.document.budget.limits.max_leaf_columns)
+        or (envelope.extent.source_size != acquisition.source_size)
+        or (envelope.extent.footer_start != acquisition.footer_start)
+        or (envelope.extent.footer_end != acquisition.footer_end)
+        or (envelope.receipt.whole_source_digest_verified is not False)
+        or (
+            (envelope.receipt.source_opens_before, envelope.receipt.total_read_bytes_before)
+            != acquisition.receipt_before
+        )
+        or (
+            (envelope.receipt.source_opens_after, envelope.receipt.total_read_bytes_after)
+            != acquisition.receipt_after
+        )
+        or (
+            envelope.receipt.ranges
+            != (
+                (0, 4),
+                (acquisition.footer_end, acquisition.source_size),
+                (acquisition.footer_start, acquisition.footer_end),
+            )
+        )
+    ):
+        raise PinnedReadRefused("invalid_contract")
+
+
 def _admit_owned_initial_page_header(
     acquisition: _LiveFooterAcquisition,
     envelope: _FooterEnvelope,
@@ -3750,126 +3844,139 @@ def _admit_owned_initial_page_header(
     column_index: int,
     budget: _PageBudget,
 ) -> _OwnedPageHeaderAdmission:
+    return _admit_owned_page_header(
+        acquisition,
+        envelope,
+        profile,
+        row_group_index=row_group_index,
+        column_index=column_index,
+        budget=budget,
+    )
+
+
+def _admit_owned_page_header(
+    acquisition: _LiveFooterAcquisition,
+    envelope: _FooterEnvelope,
+    profile: _FooterProfile,
+    *,
+    row_group_index: int,
+    column_index: int,
+    budget: _PageBudget,
+    owner: _OwnedColumnChunk | None = None,
+) -> _OwnedPageHeaderAdmission:
     from liq.store.timestamp_metadata import _read_pinned_range
 
-    _live_footer_validate(acquisition)
-    if (
-        acquisition.source._closed
-        or type(envelope) is not _FooterEnvelope
-        or type(envelope.extent) is not _FooterExtent
-        or type(envelope.receipt) is not _FooterEnvelopeReceipt
-        or envelope.payload is not acquisition.payload
-        or envelope.source_identity is not acquisition.source_identity
-        or envelope.read_budget is not acquisition.read_budget
-        or type(profile) is not _FooterProfile
-        or type(profile.document) is not _FooterDocument
-        or profile.document.payload is not envelope.payload
-        or profile.document.extent is not envelope.extent
-        or type(profile.document.budget) is not _FooterBudget
-        or type(budget) is not _PageBudget
-        or budget is not acquisition.page_budget
-        or budget.read_budget is not acquisition.read_budget
-        or budget.wire_budget is not acquisition.wire_budget
-        or profile.document.budget.wire_budget is not acquisition.wire_budget
-        or type(row_group_index) is not int
-        or row_group_index < 0
-        or type(column_index) is not int
-        or column_index < 0
-        or type(profile.chunks) is not tuple
-        or type(profile.leaves) is not tuple
-        or len(profile.chunks) > profile.document.budget.limits.max_total_column_chunks
-        or len(profile.leaves) > profile.document.budget.limits.max_leaf_columns
-        or envelope.extent.source_size != acquisition.source_size
-        or envelope.extent.footer_start != acquisition.footer_start
-        or envelope.extent.footer_end != acquisition.footer_end
-        or envelope.receipt.whole_source_digest_verified is not False
-        or (envelope.receipt.source_opens_before, envelope.receipt.total_read_bytes_before)
-        != acquisition.receipt_before
-        or (envelope.receipt.source_opens_after, envelope.receipt.total_read_bytes_after)
-        != acquisition.receipt_after
-        or envelope.receipt.ranges
-        != (
-            (0, 4),
-            (acquisition.footer_end, acquisition.source_size),
-            (acquisition.footer_start, acquisition.footer_end),
-        )
-    ):
-        raise PinnedReadRefused("invalid_contract")
-    _owned_header_flags(profile.flags)
-    _page_work(budget)
-    chunk: _FooterChunkProfile | None = None
-    for candidate in profile.chunks:
-        _page_work(budget)
+    if owner is not None:
+        if type(owner) is not _OwnedColumnChunk:
+            raise PinnedReadRefused("invalid_contract")
         if (
-            type(candidate) is not _FooterChunkProfile
-            or type(candidate.row_group_index) is not int
-            or candidate.row_group_index < 0
-            or type(candidate.column_index) is not int
-            or candidate.column_index < 0
+            owner._phase != "attempted"
+            or owner._body is not None
+            or owner.acquisition is not acquisition
+            or (owner.envelope is not envelope)
+            or (owner.profile is not profile)
+            or (owner.budget is not budget)
+            or (owner.row_group_index != row_group_index)
+            or (owner.column_index != column_index)
         ):
             raise PinnedReadRefused("invalid_contract")
-        if candidate.row_group_index == row_group_index and candidate.column_index == column_index:
-            if chunk is not None:
-                raise PinnedReadRefused("invalid_contract")
-            chunk = candidate
-    if chunk is None:
-        raise PinnedReadRefused("invalid_contract")
-    if chunk.schema_index is None:
-        raise PinnedReadRefused("unsupported_mode")
-    if type(chunk.schema_index) is not int or chunk.schema_index < 0:
-        raise PinnedReadRefused("invalid_contract")
-    leaf: _FooterLeafProfile | None = None
-    for candidate_leaf in profile.leaves:
+    _validate_owned_header_inputs(
+        acquisition,
+        envelope,
+        profile,
+        row_group_index=row_group_index,
+        column_index=column_index,
+        budget=budget,
+        expected_current_receipt=None if owner is None else owner._receipt,
+    )
+    if owner is not None and owner._page_count > 0:
+        chunk, leaf = owner._selected()
+        origin = owner._next
+        stop = owner._extent[1]
+        dictionary = chunk.dictionary_page_offset
+    else:
+        _owned_header_flags(profile.flags)
         _page_work(budget)
-        if (
-            type(candidate_leaf) is not _FooterLeafProfile
-            or type(candidate_leaf.schema_index) is not int
-            or candidate_leaf.schema_index < 0
-        ):
-            raise PinnedReadRefused("invalid_contract")
-        if candidate_leaf.schema_index == chunk.schema_index:
-            if leaf is not None:
+        chunk: _FooterChunkProfile | None = None
+        for candidate in profile.chunks:
+            _page_work(budget)
+            if (
+                type(candidate) is not _FooterChunkProfile
+                or type(candidate.row_group_index) is not int
+                or candidate.row_group_index < 0
+                or (type(candidate.column_index) is not int)
+                or (candidate.column_index < 0)
+            ):
                 raise PinnedReadRefused("invalid_contract")
-            leaf = candidate_leaf
-    if leaf is None:
-        raise PinnedReadRefused("invalid_contract")
-    _owned_header_flags(chunk.flags)
-    _owned_header_flags(leaf.flags)
-    _page_work(budget)
-    _owned_header_policy(profile, chunk, leaf)
-    extent = chunk.candidate_extent
-    if extent is None:
-        raise PinnedReadRefused("unsupported_mode")
-    if (
-        type(extent) is not tuple
-        or len(extent) != 2
-        or any(type(value) is not int for value in extent)
-    ):
-        raise PinnedReadRefused("invalid_contract")
-    origin, stop = extent
-    if origin == stop:
-        raise PinnedReadRefused("invalid_contract")
-    if not 4 <= origin < stop <= acquisition.footer_start:
-        raise PinnedReadRefused("unsupported_mode")
-    dictionary = chunk.dictionary_page_offset
-    if dictionary is not None:
-        if (
-            type(dictionary) is not int
-            or dictionary != origin
-            or chunk.data_page_offset is None
-            or not dictionary < chunk.data_page_offset < stop
-        ):
+            if (
+                candidate.row_group_index == row_group_index
+                and candidate.column_index == column_index
+            ):
+                if chunk is not None:
+                    raise PinnedReadRefused("invalid_contract")
+                chunk = candidate
+        if chunk is None:
+            raise PinnedReadRefused("invalid_contract")
+        if chunk.schema_index is None:
             raise PinnedReadRefused("unsupported_mode")
-    elif chunk.data_page_offset != origin:
-        raise PinnedReadRefused("unsupported_mode")
+        if type(chunk.schema_index) is not int or chunk.schema_index < 0:
+            raise PinnedReadRefused("invalid_contract")
+        leaf: _FooterLeafProfile | None = None
+        for candidate_leaf in profile.leaves:
+            _page_work(budget)
+            if (
+                type(candidate_leaf) is not _FooterLeafProfile
+                or type(candidate_leaf.schema_index) is not int
+                or candidate_leaf.schema_index < 0
+            ):
+                raise PinnedReadRefused("invalid_contract")
+            if candidate_leaf.schema_index == chunk.schema_index:
+                if leaf is not None:
+                    raise PinnedReadRefused("invalid_contract")
+                leaf = candidate_leaf
+        if leaf is None:
+            raise PinnedReadRefused("invalid_contract")
+        _owned_header_flags(chunk.flags)
+        _owned_header_flags(leaf.flags)
+        _page_work(budget)
+        _owned_header_policy(profile, chunk, leaf)
+        extent = chunk.candidate_extent
+        if extent is None:
+            raise PinnedReadRefused("unsupported_mode")
+        if (
+            type(extent) is not tuple
+            or len(extent) != 2
+            or any(type(value) is not int for value in extent)
+        ):
+            raise PinnedReadRefused("invalid_contract")
+        origin, stop = extent
+        if origin == stop:
+            raise PinnedReadRefused("invalid_contract")
+        if not 4 <= origin < stop <= acquisition.footer_start:
+            raise PinnedReadRefused("unsupported_mode")
+        dictionary = chunk.dictionary_page_offset
+        if dictionary is not None:
+            if (
+                type(dictionary) is not int
+                or dictionary != origin
+                or chunk.data_page_offset is None
+                or (not dictionary < chunk.data_page_offset < stop)
+            ):
+                raise PinnedReadRefused("unsupported_mode")
+        elif chunk.data_page_offset != origin:
+            raise PinnedReadRefused("unsupported_mode")
+        if owner is not None:
+            owner._chunk, owner._leaf = (chunk, leaf)
+            owner._extent = (origin, stop)
+            owner._next = origin
 
     def fetch(offset: int, length: int) -> bytes:
         if (
             type(offset) is not int
             or type(length) is not int
             or offset < 0
-            or length <= 0
-            or offset + length > stop - origin
+            or (length <= 0)
+            or (offset + length > stop - origin)
         ):
             raise PinnedReadRefused("invalid_contract")
         return _read_pinned_range(acquisition.source, offset=origin + offset, length=length)
@@ -3892,12 +3999,17 @@ def _admit_owned_initial_page_header(
         <= admission.body_end
         <= stop - origin
         or (
-            admission.page_type != 2
-            if dictionary is not None
-            else admission.page_type not in (0, 3)
+            owner is None
+            and (
+                admission.page_type != 2
+                if dictionary is not None
+                else admission.page_type not in (0, 3)
+            )
         )
     ):
         raise _CompactWireMalformed("schema_mismatch")
+    if owner is not None:
+        owner._check_header(admission, origin)
     _page_work(budget)
     return _OwnedPageHeaderAdmission(
         acquisition, envelope, profile, chunk, leaf, origin, admission, budget.work_units
@@ -4004,3 +4116,286 @@ def _owned_header_policy(
             or not 0 <= span.start <= span.end <= len(profile.document.payload)
         ):
             raise PinnedReadRefused("unsupported_mode")
+
+
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class _OwnedChunkFramingReceipt:
+    row_group_index: int
+    column_index: int
+    byte_extent: tuple[int, int]
+    page_count: int
+    data_page_count: int
+    dictionary_page_count: int
+    first_dictionary_offset: int | None
+    first_data_offset: int | None
+    compressed_total: int
+    declared_uncompressed_total: int
+    data_positions: int
+    receipt_after: tuple[int, int]
+    status: Literal["opaque_framing_provisional"]
+    whole_source_digest_verified: Literal[False]
+
+
+@dataclass(slots=True, repr=False, eq=False)
+class _OwnedColumnChunk:
+    """Mutable single-use progress for one live source-owned opaque column chunk."""
+
+    acquisition: _LiveFooterAcquisition
+    envelope: _FooterEnvelope
+    profile: _FooterProfile
+    row_group_index: int
+    column_index: int
+    budget: _PageBudget
+    _phase: Literal["ready", "attempted", "poisoned", "completed"] = _footer_record_field(
+        init=False, default="attempted"
+    )
+    _chunk: _FooterChunkProfile | None = _footer_record_field(init=False, default=None)
+    _leaf: _FooterLeafProfile | None = _footer_record_field(init=False, default=None)
+    _extent: tuple[int, int] = _footer_record_field(init=False, default=(0, 0))
+    _body: _OwnedPageBody | None = _footer_record_field(init=False, default=None)
+    _receipt: tuple[int, int] = _footer_record_field(init=False, default=(0, 0))
+    _work: int = _footer_record_field(init=False, default=0)
+    _next: int = _footer_record_field(init=False, default=0)
+    _page_count: int = _footer_record_field(init=False, default=0)
+    _data_page_count: int = _footer_record_field(init=False, default=0)
+    _dictionary_page_count: int = _footer_record_field(init=False, default=0)
+    _first_dictionary_offset: int | None = _footer_record_field(init=False, default=None)
+    _first_data_offset: int | None = _footer_record_field(init=False, default=None)
+    _compressed_total: int = _footer_record_field(init=False, default=0)
+    _declared_uncompressed_total: int = _footer_record_field(init=False, default=0)
+    _data_positions: int = _footer_record_field(init=False, default=0)
+
+    @property
+    def current_body(self) -> _OwnedPageBody:
+        if type(self) is not _OwnedColumnChunk or self._phase != "ready":
+            raise PinnedReadRefused("invalid_contract")
+        body = self._body
+        if type(body) is not _OwnedPageBody:
+            raise PinnedReadRefused("invalid_contract")
+        return body
+
+    def _selected(self) -> tuple[_FooterChunkProfile, _FooterLeafProfile]:
+        chunk, leaf = self._chunk, self._leaf
+        if type(chunk) is not _FooterChunkProfile or type(leaf) is not _FooterLeafProfile:
+            raise PinnedReadRefused("invalid_contract")
+        return chunk, leaf
+
+    def _check_ready(self, body: _OwnedPageBody, *, finishing: bool) -> None:
+        if self._phase != "ready" or type(body) is not _OwnedPageBody or body is not self._body:
+            raise PinnedReadRefused("invalid_contract")
+        _validate_owned_header_inputs(
+            self.acquisition,
+            self.envelope,
+            self.profile,
+            row_group_index=self.row_group_index,
+            column_index=self.column_index,
+            budget=self.budget,
+            expected_current_receipt=self._receipt,
+        )
+        chunk, leaf = self._selected()
+        header = body.header
+        if (
+            type(header) is not _OwnedPageHeaderAdmission
+            or header.acquisition is not self.acquisition
+            or header.envelope is not self.envelope
+            or header.profile is not self.profile
+            or header.chunk is not chunk
+            or header.leaf is not leaf
+            or chunk.row_group_index != self.row_group_index
+            or chunk.column_index != self.column_index
+            or body.receipt_after != self._receipt
+            or self.budget.work_units != self._work
+            or self.acquisition.source._closed
+            or not self._extent[0] <= self._next <= self._extent[1]
+            or (self._next != self._extent[1] if finishing else self._next == self._extent[1])
+        ):
+            raise PinnedReadRefused("invalid_contract")
+
+    def _check_header(self, admission: _PageHeaderAdmission, origin: int) -> None:
+        chunk, _ = self._selected()
+        _page_work(self.budget)
+        match admission.page_type:
+            case 1:
+                raise PinnedReadRefused("unsupported_mode")
+            case 2:
+                if (
+                    self._page_count != 0
+                    or self._dictionary_page_count != 0
+                    or chunk.dictionary_page_offset is None
+                    or origin != chunk.dictionary_page_offset
+                    or type(admission.detail) is not _PageDictionaryHeader
+                ):
+                    raise _CompactWireMalformed("schema_mismatch")
+                declared = (admission.detail.encoding,)
+            case 0 | 3:
+                if (self._page_count == 0 and chunk.dictionary_page_offset is not None) or (
+                    self._first_data_offset is None and origin != chunk.data_page_offset
+                ):
+                    raise _CompactWireMalformed("schema_mismatch")
+                match admission.detail:
+                    case _PageDataV1Header() as detail:
+                        declared = (
+                            detail.encoding,
+                            detail.definition_level_encoding,
+                            detail.repetition_level_encoding,
+                        )
+                    case _PageDataV2Header() as detail:
+                        declared = (detail.encoding,)
+                    case _:
+                        raise _CompactWireMalformed("schema_mismatch")
+                if declared[0] in (2, 8) and self._dictionary_page_count == 0:
+                    raise _CompactWireMalformed("schema_mismatch")
+            case _:
+                raise PinnedReadRefused("unsupported_mode")
+        encodings = chunk.encodings
+        if type(encodings) is not tuple:
+            raise PinnedReadRefused("invalid_contract")
+        for encoding in declared:
+            for candidate in encodings:
+                _page_work(self.budget)
+                if type(candidate) is not int:
+                    raise PinnedReadRefused("invalid_contract")
+                if candidate == encoding:
+                    break
+            else:
+                raise _CompactWireMalformed("schema_mismatch")
+
+    def _publish(self, body: _OwnedPageBody) -> None:
+        header = body.header
+        admission = header.admission
+        read = self.acquisition.read_budget
+        receipt = (read.source_opens, read.total_read_bytes)
+        if self.acquisition.source._closed or receipt != body.receipt_after:
+            raise PinnedReadRefused("invalid_contract")
+        self._page_count += 1
+        self._next = header.page_origin + admission.body_end
+        self._compressed_total += admission.header_end - admission.header_start + len(body.payload)
+        self._declared_uncompressed_total += (
+            admission.header_end - admission.header_start + admission.uncompressed_page_size
+        )
+        detail = admission.detail
+        match detail:
+            case _PageDictionaryHeader():
+                self._dictionary_page_count += 1
+                self._first_dictionary_offset = header.page_origin
+            case _PageDataV1Header() | _PageDataV2Header():
+                self._data_page_count += 1
+                self._data_positions += detail.num_values
+                if self._first_data_offset is None:
+                    self._first_data_offset = header.page_origin
+            case _:
+                raise PinnedReadRefused("invalid_contract")
+        self._body = body
+        self._receipt = receipt
+        self._work = self.budget.work_units
+        self._phase = "ready"
+
+    def _poison_attempt(self) -> None:
+        if self._phase == "attempted":
+            self._phase = "poisoned"
+            self._body = None
+
+    def advance(self, body: _OwnedPageBody) -> _OwnedPageBody:
+        if type(self) is not _OwnedColumnChunk:
+            raise PinnedReadRefused("invalid_contract")
+        self._check_ready(body, finishing=False)
+        self._phase, self._body = "attempted", None
+        try:
+            _page_work(self.budget)
+            header = _admit_owned_page_header(
+                self.acquisition,
+                self.envelope,
+                self.profile,
+                row_group_index=self.row_group_index,
+                column_index=self.column_index,
+                budget=self.budget,
+                owner=self,
+            )
+            acquired = _read_owned_page_body(header, budget=self.budget, owner=self)
+            _page_work(self.budget)
+            self._publish(acquired)
+            return acquired
+        finally:
+            self._poison_attempt()
+
+    def finish(self, body: _OwnedPageBody) -> _OwnedChunkFramingReceipt:
+        if type(self) is not _OwnedColumnChunk:
+            raise PinnedReadRefused("invalid_contract")
+        self._check_ready(body, finishing=True)
+        self._phase, self._body = "attempted", None
+        try:
+            _page_work(self.budget)
+            chunk, _ = self._selected()
+            if (
+                self._compressed_total != self._extent[1] - self._extent[0]
+                or self._compressed_total != chunk.compressed_size
+                or self._declared_uncompressed_total != chunk.uncompressed_size
+                or self._data_positions != chunk.num_values
+                or self._first_dictionary_offset != chunk.dictionary_page_offset
+                or self._first_data_offset != chunk.data_page_offset
+            ):
+                raise _CompactWireMalformed("schema_mismatch")
+            _page_work(self.budget)
+            read = self.acquisition.read_budget
+            receipt_after = (read.source_opens, read.total_read_bytes)
+            if self.acquisition.source._closed or receipt_after != self._receipt:
+                raise PinnedReadRefused("invalid_contract")
+            receipt = _OwnedChunkFramingReceipt(
+                row_group_index=self.row_group_index,
+                column_index=self.column_index,
+                byte_extent=self._extent,
+                page_count=self._page_count,
+                data_page_count=self._data_page_count,
+                dictionary_page_count=self._dictionary_page_count,
+                first_dictionary_offset=self._first_dictionary_offset,
+                first_data_offset=self._first_data_offset,
+                compressed_total=self._compressed_total,
+                declared_uncompressed_total=self._declared_uncompressed_total,
+                data_positions=self._data_positions,
+                receipt_after=receipt_after,
+                status="opaque_framing_provisional",
+                whole_source_digest_verified=False,
+            )
+            self._work = self.budget.work_units
+            self._phase = "completed"
+            return receipt
+        finally:
+            self._poison_attempt()
+
+
+def _start_owned_column_chunk(
+    acquisition: _LiveFooterAcquisition,
+    envelope: _FooterEnvelope,
+    profile: _FooterProfile,
+    *,
+    row_group_index: int,
+    column_index: int,
+    budget: _PageBudget,
+) -> _OwnedColumnChunk:
+    _validate_owned_header_inputs(
+        acquisition,
+        envelope,
+        profile,
+        row_group_index=row_group_index,
+        column_index=column_index,
+        budget=budget,
+    )
+    owner = _OwnedColumnChunk(acquisition, envelope, profile, row_group_index, column_index, budget)
+    owner._receipt = acquisition.receipt_after
+    try:
+        _page_work(budget)
+        header = _admit_owned_page_header(
+            acquisition,
+            envelope,
+            profile,
+            row_group_index=row_group_index,
+            column_index=column_index,
+            budget=budget,
+            owner=owner,
+        )
+        body = _read_owned_page_body(header, budget=budget, owner=owner)
+        _page_work(budget)
+        owner._publish(body)
+        return owner
+    finally:
+        owner._poison_attempt()

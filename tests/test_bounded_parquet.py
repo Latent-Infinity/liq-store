@@ -9899,7 +9899,7 @@ class OwnedPageBodyTests(unittest.TestCase):
             expected_flags=(),
         )
 
-    def environment(self, *args, **kwargs):
+    def environment(self: OwnedPageBodyTests | SequentialOwnedPageTests, *args, **kwargs):
         from contextlib import contextmanager
 
         @contextmanager
@@ -9936,7 +9936,7 @@ class OwnedPageBodyTests(unittest.TestCase):
             header, budget=env.ledgers.page if budget is None else budget
         )
 
-    def counters(self, env):
+    def counters(self: OwnedPageBodyTests | SequentialOwnedPageTests, env):
         return SimpleNamespace(
             read=(env.ledgers.read.source_opens, env.ledgers.read.total_read_bytes),
             closes=tuple(env.io.close_attempts),
@@ -10373,3 +10373,896 @@ class OwnedPageBodyTests(unittest.TestCase):
             self.assertEqual(tuple(env.io.close_attempts), before.closes)
             self.assertFalse(env.source._closed)
             self.assert_quiet_refusal(env, header)
+
+
+class SequentialOwnedPageTests(unittest.TestCase):
+    """Neutral wire witnesses for one source-owned opaque column chunk."""
+
+    plain_three = b"\x15\x00\x15\x06\x15\x06\x2c\x15\x02\x15\x00\x15\x06\x15\x06\x00\x00"
+    plain_two = b"\x15\x00\x15\x04\x15\x04\x2c\x15\x02\x15\x00\x15\x06\x15\x06\x00\x00"
+    dictionary_two = b"\x15\x04\x15\x04\x15\x04\x4c\x15\x04\x15\x00\x00\x00"
+    encoded_three = b"\x15\x00\x15\x06\x15\x06\x2c\x15\x02\x15\x10\x15\x06\x15\x06\x00\x00"
+    ordinary_pages = ((plain_three, b"\x01\x02\x03"), (plain_two, b"\x04\x05"))
+    mixed_pages = (
+        (dictionary_two, b"ab"),
+        (encoded_three, b"\x01\x02\x03"),
+        (plain_two, b"\x04\x05"),
+    )
+    environment = OwnedPageBodyTests.environment
+    counters = OwnedPageBodyTests.counters
+
+    def fixture(self, case=None):
+        return self.case(self.ordinary_pages) if case is None else case
+
+    def case(self, pages, metadata=None, *, rows=2, declared_size=None):
+        """Keep column, group-size and row declarations independently testable on the wire."""
+        api = FooterProfileTests()
+        segment = b"".join(header + body for header, body in pages)
+        if metadata is None:
+            metadata = api.meta(
+                values=2,
+                data=64,
+                compressed=len(segment),
+                uncompressed=len(segment),
+                encodings=(0, 3),
+            )
+        footer = api.payload(
+            (api.root(1), api.node(b"n")),
+            (
+                api.group(
+                    (api.chunk(metadata),),
+                    rows=rows,
+                    size=len(segment) if declared_size is None else declared_size,
+                ),
+            ),
+            rows=rows,
+        )
+        prefix = b"PAR1" + b"\x00" * 60 + segment
+        return SimpleNamespace(
+            payload=prefix + footer + len(footer).to_bytes(4, "little") + b"PAR1",
+            footer=footer,
+            pages=pages,
+            footer_start=len(prefix),
+        )
+
+    def mixed_case(self):
+        metadata = FooterProfileTests().meta(
+            values=2,
+            data=79,
+            compressed=54,
+            uncompressed=54,
+            encodings=(0, 3, 8),
+            extra=((11, "i64", _grammar_integer(64)),),
+        )
+        return self.case(self.mixed_pages, metadata)
+
+    def api(self):
+        start = getattr(bounded_parquet, "_start_owned_column_chunk", None)
+        self.assertTrue(callable(start), "missing source-owned sequential chunk start")
+        return start
+
+    def start(self, env):
+        owner = self.api()(
+            env.acquisition,
+            env.envelope,
+            env.profile,
+            row_group_index=0,
+            column_index=0,
+            budget=env.ledgers.page,
+        )
+        self.assertIsNotNone(owner, "missing sequential owner result")
+        return owner
+
+    def assert_prefix(self, env, before, expected):
+        after = self.counters(env)
+        self.assertEqual(
+            (
+                after.read[1] - before.read[1],
+                after.page["work_units"] - before.page["work_units"],
+                after.page["allocation_bytes"] - before.page["allocation_bytes"],
+                after.events.count("clock") - before.events.count("clock"),
+            ),
+            expected,
+        )
+        self.assertEqual(after.read[0], before.read[0])
+
+    def assert_invalid(self, env, operation):
+        before = self.counters(env)
+        with self.assertRaises(PinnedReadRefused) as caught:
+            operation()
+        self.assertEqual(caught.exception.reason_code, "invalid_contract")
+        self.assertEqual(self.counters(env), before)
+
+    def assert_poisoned(self, env, owner, body):
+        self.assert_invalid(env, lambda: owner.advance(body))
+        self.assert_invalid(env, lambda: owner.finish(body))
+        self.assert_invalid(env, lambda: owner.current_body)
+
+    def test_two_literal_data_pages_have_exact_ranges_receipts_and_ledgers(self):
+        with self.environment() as env:
+            before = self.counters(env)
+            actual = env.io.module._read_pinned_range
+            observed = []
+
+            def boundary(source, *, offset, length):
+                if offset in (81, 101):
+                    observed.append(
+                        (
+                            offset,
+                            length,
+                            env.ledgers.page.work_units - before.page["work_units"],
+                            env.ledgers.page.allocation_bytes - before.page["allocation_bytes"],
+                        )
+                    )
+                return actual(source, offset=offset, length=length)
+
+            with patch.object(env.io.module, "_read_pinned_range", side_effect=boundary):
+                owner = self.start(env)
+                first = owner.current_body
+                self.assertEqual(first.payload, b"\x01\x02\x03")
+                self.assertEqual(first.header.absolute_body_span, (81, 84))
+                self.assert_prefix(env, before, (20, 95, 176, 167))
+                self.assertEqual(
+                    [request[1:] for request in env.io.positional_requests[len(before.requests) :]],
+                    [(1, offset) for offset in range(64, 81)] + [(3, 81)],
+                )
+                second = owner.advance(first)
+                self.assertIs(owner.current_body, second)
+                self.assertEqual(second.payload, b"\x04\x05")
+                self.assertEqual(second.header.absolute_body_span, (101, 103))
+                self.assert_prefix(env, before, (39, 186, 350, 330))
+                receipt = owner.finish(second)
+            self.assertEqual(observed, [(81, 3, 90, 176), (101, 2, 181, 350)])
+            self.assert_prefix(env, before, (39, 188, 350, 332))
+            self.assertEqual(
+                [request[1:] for request in env.io.positional_requests[len(before.requests) :]],
+                [(1, offset) for offset in range(64, 81)]
+                + [(3, 81)]
+                + [(1, offset) for offset in range(84, 101)]
+                + [(2, 101)],
+            )
+            self.assertEqual((receipt.row_group_index, receipt.column_index), (0, 0))
+            self.assertEqual(receipt.byte_extent, (64, 103))
+            self.assertEqual((receipt.page_count, receipt.data_page_count), (2, 2))
+            self.assertEqual(receipt.dictionary_page_count, 0)
+            self.assertIsNone(receipt.first_dictionary_offset)
+            self.assertEqual(receipt.first_data_offset, 64)
+            self.assertEqual(
+                (receipt.compressed_total, receipt.declared_uncompressed_total), (39, 39)
+            )
+            self.assertEqual(receipt.data_positions, 2)
+            self.assertEqual(receipt.receipt_after, self.counters(env).read)
+            self.assertEqual(receipt.status, "opaque_framing_provisional")
+            self.assertIs(receipt.whole_source_digest_verified, False)
+            self.assertFalse(env.profile.read_eligible)
+            self.assertFalse(first.header.admission.decode_eligible)
+            after = self.counters(env)
+            self.assertEqual(
+                (after.wire[0] - before.wire[0], after.wire[5] - before.wire[5]), (34, 306)
+            )
+            self.assertEqual(after.page["compressed_bytes"] - before.page["compressed_bytes"], 5)
+            self.assertEqual(
+                after.page["uncompressed_bytes"] - before.page["uncompressed_bytes"], 5
+            )
+            self.assertEqual(after.page["values"] - before.page["values"], 2)
+            with self.assertRaises(FrozenInstanceError):
+                receipt.data_positions = 99
+
+    def test_dictionary_and_mixed_data_encodings_reconcile_without_counting_entries(self):
+        with self.environment(case=self.mixed_case()) as env:
+            before = self.counters(env)
+            owner = self.start(env)
+            dictionary = owner.current_body
+            self.assertEqual(dictionary.payload, b"ab")
+            self.assert_prefix(env, before, (15, 75, 108, 131))
+            encoded = owner.advance(dictionary)
+            self.assertEqual(encoded.payload, b"\x01\x02\x03")
+            self.assertEqual(encoded.header.page_origin, 79)
+            self.assert_prefix(env, before, (35, 168, 284, 296))
+            plain = owner.advance(encoded)
+            self.assertEqual(plain.header.page_origin, 99)
+            self.assert_prefix(env, before, (54, 259, 458, 459))
+            receipt = owner.finish(plain)
+            self.assert_prefix(env, before, (54, 261, 458, 461))
+            self.assertEqual((receipt.page_count, receipt.data_page_count), (3, 2))
+            self.assertEqual(receipt.dictionary_page_count, 1)
+            self.assertEqual((receipt.first_dictionary_offset, receipt.first_data_offset), (64, 79))
+            self.assertEqual(receipt.data_positions, 2)
+            after = self.counters(env)
+            self.assertEqual(
+                after.page["dictionary_entries"] - before.page["dictionary_entries"], 2
+            )
+            self.assertEqual(
+                after.page["dictionary_payload_bytes"] - before.page["dictionary_payload_bytes"], 2
+            )
+            self.assertEqual(
+                (after.wire[0] - before.wire[0], after.wire[5] - before.wire[5]), (47, 397)
+            )
+
+    def test_legacy_dictionary_value_encoding_can_follow_the_owned_dictionary(self):
+        encoded = self.encoded_three[:10] + b"\x04" + self.encoded_three[11:]
+        pages = (self.mixed_pages[0], (encoded, b"\x01\x02\x03"), self.mixed_pages[2])
+        metadata = FooterProfileTests().meta(
+            values=2,
+            data=79,
+            compressed=54,
+            uncompressed=54,
+            encodings=(0, 3, 8, 2),
+            extra=((11, "i64", _grammar_integer(64)),),
+        )
+        with self.environment(case=self.case(pages, metadata)) as env:
+            before = self.counters(env)
+            owner = self.start(env)
+            encoded_body = owner.advance(owner.current_body)
+            self.assertEqual(encoded_body.header.admission.detail.encoding, 2)
+            last = owner.advance(encoded_body)
+            receipt = owner.finish(last)
+            self.assertEqual(receipt.data_positions, 2)
+            self.assert_prefix(env, before, (54, 262, 458, 462))
+
+    def test_wrong_acknowledgment_and_early_finish_are_pure_and_recoverable(self):
+        with self.environment() as env:
+            owner = self.start(env)
+            first = owner.current_body
+            self.assert_invalid(env, lambda: owner.advance(object()))
+            self.assert_invalid(env, lambda: owner.advance(replace(first)))
+            self.assert_invalid(env, lambda: owner.finish(first))
+            self.assertIs(owner.current_body, first)
+            second = owner.advance(first)
+            self.assert_invalid(env, lambda: owner.advance(first))
+            self.assert_invalid(env, lambda: owner.advance(second))
+            self.assertIs(owner.current_body, second)
+            owner.finish(second)
+            self.assert_invalid(env, lambda: owner.finish(second))
+            self.assert_invalid(env, lambda: owner.current_body)
+
+        with self.environment() as env:
+            owner = self.start(env)
+            first = owner.current_body
+            for slot in ("_body", "_chunk", "_leaf"):
+                for invalid in (None, object()):
+                    with self.subTest(slot=slot, invalid_type=type(invalid).__name__):
+                        saved = getattr(owner, slot)
+                        setattr(owner, slot, invalid)
+                        try:
+                            if slot == "_body":
+                                self.assert_invalid(env, lambda: owner.current_body)
+                            self.assert_invalid(env, lambda: owner.advance(first))
+                            self.assertEqual(owner._phase, "ready")
+                        finally:
+                            setattr(owner, slot, saved)
+                        self.assertIs(owner.current_body, first)
+            second = owner.advance(first)
+            self.assertEqual(owner.finish(second).page_count, 2)
+
+    def test_dictionary_payload_encoding_is_not_a_prior_dictionary_requirement(self):
+        dictionary = self.dictionary_two[:10] + b"\x04" + self.dictionary_two[11:]
+        pages = ((dictionary, b"ab"), self.mixed_pages[1], self.mixed_pages[2])
+        metadata = FooterProfileTests().meta(
+            values=2,
+            data=79,
+            compressed=54,
+            uncompressed=54,
+            encodings=(0, 3, 8, 2),
+            extra=((11, "i64", _grammar_integer(64)),),
+        )
+        with self.environment(case=self.case(pages, metadata)) as env:
+            before = self.counters(env)
+            owner = self.start(env)
+            self.assertEqual(owner.current_body.header.admission.detail.encoding, 2)
+            encoded = owner.advance(owner.current_body)
+            last = owner.advance(encoded)
+            self.assertEqual(owner.finish(last).data_positions, 2)
+            self.assert_prefix(env, before, (54, 264, 458, 464))
+
+    def test_intervening_actual_read_and_work_or_closed_source_are_pure_refusals(self):
+        for operation, fault in (
+            (operation, fault)
+            for operation in ("advance", "finish")
+            for fault in ("read", "work", "closed")
+        ):
+            with self.subTest(operation=operation, fault=fault), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                if operation == "finish":
+                    body = owner.advance(body)
+                if fault == "read":
+                    self.assertEqual(
+                        env.io.module._read_pinned_range(env.source, offset=0, length=1), b"P"
+                    )
+                elif fault == "work":
+                    env.ledgers.page.reserve(bounded_parquet._PageCharge(work_units=1))
+                else:
+                    env.source._closed = True
+                try:
+                    action = owner.advance if operation == "advance" else owner.finish
+                    self.assert_invalid(env, lambda action=action, body=body: action(body))
+                finally:
+                    if fault == "closed":
+                        env.source._closed = False
+
+        for operation, final_work, expected in (
+            ("advance", 186, (19, 91, 174, 163)),
+            ("finish", 188, (0, 2, 0, 2)),
+        ):
+            with self.subTest(late_closure=operation), self.environment() as env:
+                work_origin = env.ledgers.page.work_units
+                owner = self.start(env)
+                body = owner.current_body
+                if operation == "finish":
+                    body = owner.advance(body)
+                before = self.counters(env)
+                original_clock = env.ledgers.read.clock_ns
+                fired = []
+
+                def closing_clock(
+                    clock=original_clock,
+                    page=env.ledgers.page,
+                    source=env.source,
+                    target_work=work_origin + final_work,
+                    events=fired,
+                ) -> int:
+                    stamp = clock()
+                    if not events and page.work_units == target_work - 1:
+                        events.append("closed")
+                        source._closed = True
+                    return stamp
+
+                env.ledgers.read.clock_ns = closing_clock
+                try:
+                    with self.assertRaises(PinnedReadRefused) as caught:
+                        getattr(owner, operation)(body)
+                    self.assertEqual(caught.exception.reason_code, "invalid_contract")
+                    self.assertEqual(fired, ["closed"])
+                    self.assertEqual(env.ledgers.page.work_units, work_origin + final_work)
+                    self.assert_prefix(env, before, expected)
+                    self.assertEqual(owner._phase, "poisoned")
+                    self.assert_poisoned(env, owner, body)
+                finally:
+                    env.ledgers.read.clock_ns = original_clock
+                    env.source._closed = False
+
+    def test_successor_work_limits_keep_literal_prefix_and_poison_admitted_transition(self):
+        cases = (
+            (0, 0, 0),
+            (77, 17, 170),
+            (78, 17, 170),
+            (79, 17, 170),
+            (82, 17, 170),
+            (83, 17, 170),
+            (84, 17, 170),
+            (85, 17, 174),
+            (86, 19, 174),
+            (89, 19, 174),
+            (90, 19, 174),
+        )
+        for allowance, read_bytes, allocation in cases:
+            with self.subTest(allowance=allowance), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                env.ledgers.page.limits = replace(
+                    env.ledgers.page.limits,
+                    max_work_units=before.page["work_units"] + allowance,
+                )
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    owner.advance(body)
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                after = self.counters(env)
+                self.assertEqual(after.read[1] - before.read[1], read_bytes)
+                self.assertEqual(after.page["work_units"] - before.page["work_units"], allowance)
+                self.assertEqual(
+                    after.page["allocation_bytes"] - before.page["allocation_bytes"], allocation
+                )
+                self.assert_poisoned(env, owner, body)
+
+    def test_finish_work_limits_poison_without_reading_or_publishing(self):
+        for allowance in (0, 1):
+            with self.subTest(allowance=allowance), self.environment() as env:
+                owner = self.start(env)
+                last = owner.advance(owner.current_body)
+                before = self.counters(env)
+                env.ledgers.page.limits = replace(
+                    env.ledgers.page.limits,
+                    max_work_units=before.page["work_units"] + allowance,
+                )
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    owner.finish(last)
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                self.assert_prefix(env, before, (0, allowance, 0, allowance + 1))
+                self.assert_poisoned(env, owner, last)
+
+    def test_initial_policy_refusals_precede_stamp_and_body_acquisition(self):
+        api = FooterProfileTests()
+        encoded = self.plain_three[:10] + b"\x10" + self.plain_three[11:]
+        legacy_encoded = self.plain_three[:10] + b"\x04" + self.plain_three[11:]
+        cases = (
+            ((encoded, b"\x01\x02\x03"), (0, 3, 8), 82, 152),
+            ((legacy_encoded, b"\x01\x02\x03"), (0, 2, 3), 82, 152),
+            ((self.plain_three, b"\x01\x02\x03"), (3,), 83, 153),
+        )
+        for page, encodings, work, clocks in cases:
+            pages = (page, self.ordinary_pages[1])
+            metadata = api.meta(
+                values=2, data=64, compressed=39, uncompressed=39, encodings=encodings
+            )
+            with (
+                self.subTest(encodings=encodings),
+                self.environment(case=self.case(pages, metadata)) as env,
+            ):
+                before = self.counters(env)
+                with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+                    self.start(env)
+                self.assertEqual(caught.exception.reason_code, "schema_mismatch")
+                self.assert_prefix(env, before, (17, work, 170, clocks))
+                self.assertEqual(
+                    [request[1:] for request in env.io.positional_requests[len(before.requests) :]],
+                    [(1, offset) for offset in range(64, 81)],
+                )
+
+        # These are typed-profile misuse cases, not malformed provider observations.
+        for encodings, work in (
+            (None, 1),
+            ([0, 3], 1),
+            ((True, 3), 2),
+            (("not-an-encoding", 3), 2),
+        ):
+            with self.subTest(policy_encodings=encodings), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                original_chunk = owner._chunk
+                owner._chunk = replace(original_chunk, encodings=encodings)
+                before = self.counters(env)
+                try:
+                    with self.assertRaises(PinnedReadRefused) as caught:
+                        owner._check_header(body.header.admission, body.header.page_origin)
+                    self.assertEqual(caught.exception.reason_code, "invalid_contract")
+                    self.assert_prefix(env, before, (0, work, 0, work))
+                    self.assertEqual(self.counters(env).requests, before.requests)
+                    self.assertEqual(self.counters(env).wire, before.wire)
+                    self.assertEqual(owner._phase, "ready")
+                    self.assertIs(owner.current_body, body)
+                finally:
+                    owner._chunk = original_chunk
+
+    def test_dictionary_order_and_first_data_offset_refuse_before_later_body(self):
+        api = FooterProfileTests()
+        cases = (
+            (
+                (self.mixed_pages[0], self.mixed_pages[0], *self.ordinary_pages),
+                api.meta(
+                    values=2,
+                    data=79,
+                    compressed=69,
+                    uncompressed=69,
+                    encodings=(0, 3),
+                    extra=((11, "i64", _grammar_integer(64)),),
+                ),
+                1,
+                92,
+            ),
+            (
+                (*self.ordinary_pages, self.mixed_pages[0]),
+                api.meta(values=2, data=64, compressed=54, uncompressed=54, encodings=(0, 3)),
+                2,
+                116,
+            ),
+            (
+                self.mixed_pages,
+                api.meta(
+                    values=2,
+                    data=80,
+                    compressed=54,
+                    uncompressed=54,
+                    encodings=(0, 3, 8),
+                    extra=((11, "i64", _grammar_integer(64)),),
+                ),
+                1,
+                96,
+            ),
+        )
+        for pages, metadata, accepted_pages, refused_body_start in cases:
+            with (
+                self.subTest(accepted_pages=accepted_pages, refused_body_start=refused_body_start),
+                self.environment(case=self.case(pages, metadata)) as env,
+            ):
+                owner = self.start(env)
+                body = owner.current_body
+                for _ in range(accepted_pages - 1):
+                    body = owner.advance(body)
+                before = self.counters(env)
+                with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+                    owner.advance(body)
+                self.assertEqual(caught.exception.reason_code, "schema_mismatch")
+                requests = env.io.positional_requests[len(before.requests) :]
+                self.assertTrue(requests)
+                self.assertTrue(all(offset < refused_body_start for _, _, offset in requests))
+                self.assert_poisoned(env, owner, body)
+
+    def test_index_and_unknown_page_types_refuse_without_body_reads(self):
+        index = b"\x15\x02\x15\x04\x15\x04\x3c\x00\x00"
+        unknown = b"\x15\x08" + self.plain_three[2:]
+        api = FooterProfileTests()
+        for header, body in ((index, b"ab"), (unknown, b"\x01\x02\x03")):
+            length = len(header) + len(body)
+            metadata = api.meta(
+                values=0, data=64, compressed=length, uncompressed=length, encodings=(0, 3)
+            )
+            case = self.case(((header, body),), metadata, rows=0)
+            with self.subTest(header=header), self.environment(case=case) as env:
+                before = self.counters(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    self.start(env)
+                self.assertEqual(caught.exception.reason_code, "unsupported_mode")
+                self.assertEqual(self.counters(env).read[1] - before.read[1], len(header))
+                self.assertTrue(
+                    all(
+                        offset < 64 + len(header)
+                        for _, _, offset in env.io.positional_requests[len(before.requests) :]
+                    )
+                )
+        metadata = api.meta(values=1, data=64, compressed=31, uncompressed=31, encodings=(0, 3))
+        case = self.case((self.ordinary_pages[0], (index, b"ab")), metadata, rows=1)
+        with self.environment(case=case) as env:
+            owner = self.start(env)
+            body = owner.current_body
+            before = self.counters(env)
+            with self.assertRaises(PinnedReadRefused) as caught:
+                owner.advance(body)
+            self.assertEqual(caught.exception.reason_code, "unsupported_mode")
+            self.assertEqual(self.counters(env).read[1] - before.read[1], 9)
+            self.assertTrue(
+                all(
+                    offset < 93
+                    for _, _, offset in env.io.positional_requests[len(before.requests) :]
+                )
+            )
+            self.assert_poisoned(env, owner, body)
+
+        for page_type, detail, error, reason in (
+            (0, object(), bounded_parquet._CompactWireMalformed, "schema_mismatch"),
+            (4, None, PinnedReadRefused, "unsupported_mode"),
+        ):
+            with self.subTest(policy_page_type=page_type), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                admission = replace(body.header.admission, page_type=page_type, detail=detail)
+                before = self.counters(env)
+                with self.assertRaises(error) as caught:
+                    owner._check_header(admission, body.header.page_origin)
+                self.assertEqual(caught.exception.reason_code, reason)
+                self.assert_prefix(env, before, (0, 1, 0, 1))
+                self.assertEqual(self.counters(env).requests, before.requests)
+                self.assertEqual(self.counters(env).wire, before.wire)
+                self.assertEqual(owner._phase, "ready")
+                self.assertIs(owner.current_body, body)
+
+    def test_declared_uncompressed_and_data_position_mismatches_poison_finish(self):
+        api = FooterProfileTests()
+        for values, uncompressed in ((3, 39), (2, 40)):
+            metadata = api.meta(
+                values=values,
+                data=64,
+                compressed=39,
+                uncompressed=uncompressed,
+                encodings=(0, 3),
+            )
+            case = self.case(self.ordinary_pages, metadata, rows=values, declared_size=uncompressed)
+            with (
+                self.subTest(values=values, uncompressed=uncompressed),
+                self.environment(case=case) as env,
+            ):
+                owner = self.start(env)
+                last = owner.advance(owner.current_body)
+                before = self.counters(env)
+                with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+                    owner.finish(last)
+                self.assertEqual(caught.exception.reason_code, "schema_mismatch")
+                self.assert_prefix(env, before, (0, 1, 0, 1))
+                self.assert_poisoned(env, owner, last)
+
+    def test_truncated_successor_and_unframed_tail_prevent_completion(self):
+        cases = (
+            (self.ordinary_pages[0], (self.plain_two[:-1], b"")),
+            (self.ordinary_pages[0], (self.plain_two, b"\x04")),
+            (*self.ordinary_pages, (b"\x00", b"")),
+        )
+        for pages in cases:
+            with self.subTest(last=pages[-1]), self.environment(case=self.case(pages)) as env:
+                owner = self.start(env)
+                body = owner.current_body
+                if len(pages) == 3:
+                    body = owner.advance(body)
+                with self.assertRaises((PinnedReadRefused, bounded_parquet._CompactWireMalformed)):
+                    owner.advance(body)
+                self.assert_poisoned(env, owner, body)
+
+    def test_later_crc_mismatch_retains_actual_acquisition_without_completion(self):
+        bad_crc = b"\x15\x00\x15\x12\x15\x12\x15\x00\x1c\x15\x02\x15\x00\x15\x06\x15\x06\x00\x00"
+        pages = (self.ordinary_pages[0], (bad_crc, b"123456789"))
+        with self.environment(case=self.case(pages)) as env:
+            owner = self.start(env)
+            body = owner.current_body
+            before = self.counters(env)
+            with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+                owner.advance(body)
+            self.assertEqual(caught.exception.reason_code, "invalid_wire")
+            self.assertEqual(self.counters(env).read[1] - before.read[1], 28)
+            self.assertEqual(
+                [request[1:] for request in env.io.positional_requests[len(before.requests) :]][-1],
+                (9, 103),
+            )
+            self.assert_poisoned(env, owner, body)
+
+    def test_actual_short_body_and_os_failure_preserve_exact_prefix(self):
+        for fault, expected in (("short", (18, 86, 174, 158)), ("os", (17, 86, 174, 157))):
+            with self.subTest(fault=fault), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                if fault == "short":
+                    env.io.responses[(101, 2)] = b"\x04"
+                else:
+                    env.io.fail_pread = len(before.requests) + 18
+                with self.assertRaises((env.io.module.TimestampMetadataRefused, OSError)):
+                    owner.advance(body)
+                self.assert_prefix(env, before, expected)
+                self.assert_poisoned(env, owner, body)
+
+    def test_entry_and_postread_deadline_failures_poison_without_refund(self):
+        for fault, expected in (("entry", (0, 0, 0, 1)), ("postread", (19, 86, 174, 158))):
+            with self.subTest(fault=fault), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                if fault == "entry":
+                    env.io.expired = True
+                else:
+                    env.io.expire_after = f"pread:{len(before.requests) + 18}"
+                try:
+                    with self.assertRaises(PinnedReadRefused) as caught:
+                        owner.advance(body)
+                    self.assertEqual(caught.exception.reason_code, "deadline_exceeded")
+                    self.assert_prefix(env, before, expected)
+                finally:
+                    env.io.expired = False
+                self.assert_poisoned(env, owner, body)
+
+    def test_successor_allocation_is_reserved_atomically_before_body(self):
+        for allowance in (173, 174):
+            with self.subTest(allowance=allowance), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                env.ledgers.page.limits = replace(
+                    env.ledgers.page.limits,
+                    max_allocation_bytes=before.page["allocation_bytes"] + allowance,
+                )
+                if allowance == 173:
+                    with self.assertRaises(PinnedReadRefused) as caught:
+                        owner.advance(body)
+                    self.assertEqual(caught.exception.reason_code, "resource_limit")
+                    self.assert_prefix(env, before, (17, 84, 170, 155))
+                    self.assert_poisoned(env, owner, body)
+                else:
+                    last = owner.advance(body)
+                    self.assert_prefix(env, before, (19, 91, 174, 163))
+                    owner.finish(last)
+
+    def test_empty_body_and_present_zero_crc_are_distinct_without_zero_length_reads(self):
+        empty = b"\x15\x00\x15\x00\x15\x00\x2c\x15\x00\x15\x00\x15\x06\x15\x06\x00\x00"
+        zero_crc = b"\x15\x00\x15\x00\x15\x00\x15\x00\x1c\x15\x00\x15\x00\x15\x06\x15\x06\x00\x00"
+        for header, verified in ((empty, False), (zero_crc, True)):
+            metadata = FooterProfileTests().meta(
+                values=0,
+                data=64,
+                compressed=len(header),
+                uncompressed=len(header),
+                encodings=(0, 3),
+            )
+            case = self.case(((header, b""),), metadata, rows=0)
+            with self.subTest(verified=verified), self.environment(case=case) as env:
+                before = self.counters(env)
+                owner = self.start(env)
+                body = owner.current_body
+                self.assertEqual(body.payload, b"")
+                self.assertIs(body.crc_verified, verified)
+                self.assertEqual(self.counters(env).read[1] - before.read[1], len(header))
+                self.assertTrue(
+                    all(
+                        length == 1
+                        for _, length, _ in env.io.positional_requests[len(before.requests) :]
+                    )
+                )
+                receipt = owner.finish(body)
+                self.assertEqual(receipt.data_positions, 0)
+                self.assertEqual(receipt.byte_extent, (64, 64 + len(header)))
+
+    def test_v2_policy_does_not_invent_explicit_level_encoding_fields(self):
+        header = (
+            b"\x15\x06\x15\x06\x15\x06\x5c\x15\x02\x15\x00\x15\x02\x15\x00\x15\x00\x15\x00\x00\x00"
+        )
+        metadata = FooterProfileTests().meta(
+            values=1, data=64, compressed=24, uncompressed=24, encodings=(0,)
+        )
+        case = self.case(((header, b"abc"),), metadata, rows=1)
+        with self.environment(case=case) as env:
+            before = self.counters(env)
+            owner = self.start(env)
+            body = owner.current_body
+            self.assertEqual(body.header.admission.page_type, 3)
+            self.assertEqual(body.payload, b"abc")
+            receipt = owner.finish(body)
+            self.assertEqual(receipt.data_positions, 1)
+            self.assertEqual(self.counters(env).read[1] - before.read[1], 24)
+
+    def test_successor_body_uses_the_existing_segment_cap(self):
+        header = (
+            b"\x15\x00\x15\x82\x80\x80\x01\x15\x82\x80\x80\x01\x2c"
+            b"\x15\x02\x15\x00\x15\x06\x15\x06\x00\x00"
+        )
+        pages = (self.ordinary_pages[0], (header, b"n" * (1024 * 1024 + 1)))
+        with self.environment(case=self.case(pages)) as env:
+            owner = self.start(env)
+            before = self.counters(env)
+            last = owner.advance(owner.current_body)
+            self.assertEqual(len(last.payload), 1024 * 1024 + 1)
+            self.assertEqual(
+                [request[1:] for request in env.io.positional_requests[len(before.requests) :]],
+                [(1, offset) for offset in range(84, 107)]
+                + [(1024 * 1024, 107), (1, 107 + 1024 * 1024)],
+            )
+            receipt = owner.finish(last)
+            self.assertEqual(receipt.compressed_total, 1048620)
+
+    def test_final_identity_and_cleanup_failure_prevent_outer_publication(self):
+        for fault in ("identity", "close"):
+            published = []
+            with self.subTest(fault=fault):
+                with self.assertRaises((OSError, StorageError)):
+                    with self.environment() as env:
+                        owner = self.start(env)
+                        last = owner.advance(owner.current_body)
+                        receipt = owner.finish(last)
+                        if fault == "identity":
+                            env.io.after = env.io.metadata(st_ino=99)
+                        else:
+                            env.io.close_errors[env.io.acquired[-1]] = OSError("neutral cleanup")
+                    published.append(receipt)
+                self.assertEqual(published, [])
+                self.assertCountEqual(env.io.close_attempts, env.io.acquired)
+
+    def test_legacy_initial_wrappers_keep_unmodified_ledger_costs(self):
+        with self.environment() as env:
+            before = self.counters(env)
+            header = bounded_parquet._admit_owned_initial_page_header(
+                env.acquisition,
+                env.envelope,
+                env.profile,
+                row_group_index=0,
+                column_index=0,
+                budget=env.ledgers.page,
+            )
+            self.assert_prefix(env, before, (17, 81, 170, 151))
+            result = bounded_parquet._read_owned_initial_page_body(header, budget=env.ledgers.page)
+            self.assertEqual(result.payload, b"\x01\x02\x03")
+            self.assert_prefix(env, before, (20, 87, 176, 159))
+
+    def test_start_rejects_foreign_outer_bindings_without_clock_or_acquisition(self):
+        with self.environment() as env:
+            start = self.api()
+            copied_payload = bytes(bytearray(env.envelope.payload))
+            foreign_envelope = replace(env.envelope, payload=copied_payload)
+            foreign_profile = replace(
+                env.profile, document=replace(env.profile.document, payload=copied_payload)
+            )
+            foreign_budget = bounded_parquet._PageBudget(
+                read_budget=env.ledgers.read,
+                wire_budget=env.ledgers.wire,
+                limits=env.ledgers.page.limits,
+            )
+            self.assert_invalid(
+                env,
+                lambda: start(
+                    env.acquisition,
+                    foreign_envelope,
+                    env.profile,
+                    row_group_index=0,
+                    column_index=0,
+                    budget=env.ledgers.page,
+                ),
+            )
+            self.assert_invalid(
+                env,
+                lambda: start(
+                    env.acquisition,
+                    env.envelope,
+                    foreign_profile,
+                    row_group_index=0,
+                    column_index=0,
+                    budget=env.ledgers.page,
+                ),
+            )
+            self.assert_invalid(
+                env,
+                lambda: start(
+                    env.acquisition,
+                    env.envelope,
+                    env.profile,
+                    row_group_index=0,
+                    column_index=0,
+                    budget=foreign_budget,
+                ),
+            )
+            self.assert_invalid(
+                env,
+                lambda: start(
+                    env.acquisition,
+                    env.envelope,
+                    env.profile,
+                    row_group_index=-1,
+                    column_index=0,
+                    budget=env.ledgers.page,
+                ),
+            )
+
+        with self.environment() as env:
+            owner = self.start(env)
+            body = owner.current_body
+            admit_header = getattr(bounded_parquet, "_admit_owned_page_header", None)
+            read_body = getattr(bounded_parquet, "_read_owned_page_body", None)
+            if not callable(admit_header) or not callable(read_body):
+                self.fail("missing owned-page header/body helper")
+            for supplied_owner in (object(), owner):
+                with self.subTest(helper_owner_type=type(supplied_owner).__name__):
+                    self.assert_invalid(
+                        env,
+                        lambda supplied_owner=supplied_owner: admit_header(
+                            env.acquisition,
+                            env.envelope,
+                            env.profile,
+                            row_group_index=0,
+                            column_index=0,
+                            budget=env.ledgers.page,
+                            owner=supplied_owner,
+                        ),
+                    )
+                    self.assert_invalid(
+                        env,
+                        lambda supplied_owner=supplied_owner: read_body(
+                            body.header, budget=env.ledgers.page, owner=supplied_owner
+                        ),
+                    )
+                    self.assertEqual(owner._phase, "ready")
+                    self.assertIs(owner.current_body, body)
+
+            foreign_profile = replace(env.profile)
+            foreign_header = replace(body.header, profile=foreign_profile)
+            owner._phase, owner._body = "attempted", None
+            try:
+                self.assert_invalid(
+                    env,
+                    lambda: admit_header(
+                        env.acquisition,
+                        env.envelope,
+                        foreign_profile,
+                        row_group_index=0,
+                        column_index=0,
+                        budget=env.ledgers.page,
+                        owner=owner,
+                    ),
+                )
+                self.assert_invalid(
+                    env,
+                    lambda: read_body(foreign_header, budget=env.ledgers.page, owner=owner),
+                )
+                self.assertEqual(owner._phase, "attempted")
+                self.assertIsNone(owner._body)
+            finally:
+                owner._phase, owner._body = "ready", body
+            owner_type = type(owner)
+            self.assert_invalid(env, lambda: owner_type.advance(object(), body))
+            self.assert_invalid(env, lambda: owner_type.finish(object(), body))
+            self.assertIs(owner.current_body, body)
+            second = owner.advance(body)
+            self.assertEqual(owner.finish(second).page_count, 2)
