@@ -4136,6 +4136,15 @@ class _OwnedChunkFramingReceipt:
     whole_source_digest_verified: Literal[False]
 
 
+@dataclass(frozen=True, slots=True, repr=False, eq=False)
+class _OwnedPageLevels:
+    body: _OwnedPageBody
+    summary: _PageLevelSummary
+    receipt_after: tuple[int, int]
+    work_before: int
+    work_after: int
+
+
 @dataclass(slots=True, repr=False, eq=False)
 class _OwnedColumnChunk:
     """Mutable single-use progress for one live source-owned opaque column chunk."""
@@ -4153,6 +4162,7 @@ class _OwnedColumnChunk:
     _leaf: _FooterLeafProfile | None = _footer_record_field(init=False, default=None)
     _extent: tuple[int, int] = _footer_record_field(init=False, default=(0, 0))
     _body: _OwnedPageBody | None = _footer_record_field(init=False, default=None)
+    _levels: _OwnedPageLevels | None = _footer_record_field(init=False, default=None)
     _receipt: tuple[int, int] = _footer_record_field(init=False, default=(0, 0))
     _work: int = _footer_record_field(init=False, default=0)
     _next: int = _footer_record_field(init=False, default=0)
@@ -4294,12 +4304,59 @@ class _OwnedColumnChunk:
         if self._phase == "attempted":
             self._phase = "poisoned"
             self._body = None
+            self._levels = None
+
+    def consume_levels(self, body: _OwnedPageBody) -> _OwnedPageLevels:
+        """Scan one current uncompressed data page within the owner's shared work budget."""
+        if type(self) is not _OwnedColumnChunk:
+            raise PinnedReadRefused("invalid_contract")
+        self._check_ready(body, finishing=self._next == self._extent[1])
+        if self._levels is not None:
+            raise PinnedReadRefused("invalid_contract")
+        header = body.header
+        if header.chunk.codec != 0:
+            raise PinnedReadRefused("unsupported_mode")
+        match header.admission.detail:
+            case _PageDataV1Header() | _PageDataV2Header() as detail:
+                pass
+            case _:
+                raise PinnedReadRefused("unsupported_mode")
+        definition_depth = header.leaf.definition_depth
+        repetition_depth = header.leaf.repetition_depth
+        if definition_depth is None or repetition_depth is None:
+            raise PinnedReadRefused("invalid_contract")
+        section = _PageLevelInput(
+            body.payload, 0, len(body.payload), detail, definition_depth, repetition_depth
+        )
+        _validate_level_input(section, self.budget)
+        work_before = self.budget.work_units
+        self._phase, self._body = "attempted", None
+        try:
+            _page_work(self.budget)
+            if len(body.payload) != header.admission.uncompressed_page_size:
+                raise _CompactWireMalformed("schema_mismatch")
+            summary = _scan_page_levels(section, budget=self.budget)
+            _page_work(self.budget)
+            read = self.acquisition.read_budget
+            receipt_after = (read.source_opens, read.total_read_bytes)
+            if self.acquisition.source._closed or receipt_after != self._receipt:
+                raise PinnedReadRefused("invalid_contract")
+            result = _OwnedPageLevels(
+                body, summary, receipt_after, work_before, self.budget.work_units
+            )
+            self._body, self._levels = body, result
+            self._work = self.budget.work_units
+            self._phase = "ready"
+            return result
+        finally:
+            self._poison_attempt()
 
     def advance(self, body: _OwnedPageBody) -> _OwnedPageBody:
         if type(self) is not _OwnedColumnChunk:
             raise PinnedReadRefused("invalid_contract")
         self._check_ready(body, finishing=False)
         self._phase, self._body = "attempted", None
+        self._levels = None
         try:
             _page_work(self.budget)
             header = _admit_owned_page_header(
@@ -4323,6 +4380,7 @@ class _OwnedColumnChunk:
             raise PinnedReadRefused("invalid_contract")
         self._check_ready(body, finishing=True)
         self._phase, self._body = "attempted", None
+        self._levels = None
         try:
             _page_work(self.budget)
             chunk, _ = self._selected()

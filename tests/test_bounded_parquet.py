@@ -11266,3 +11266,410 @@ class SequentialOwnedPageTests(unittest.TestCase):
             self.assertIs(owner.current_body, body)
             second = owner.advance(body)
             self.assertEqual(owner.finish(second).page_count, 2)
+
+    def level_case(
+        self, version="v1", *, repetition=0, n=8, malformed=False, codec=0, uncompressed_extra=0
+    ):
+        """Compose admitted neutral level wires through the existing footer/page helpers."""
+        levels = PageLevelScanTests().section(
+            version,
+            n=n,
+            max_def=int(repetition > 0),
+            max_rep=int(repetition == 2),
+            repetition=b"\x03\xaa" if repetition == 2 and n else b"",
+            definition=b"\x03\x55" if repetition and n else b"",
+            nulls=n // 2 if repetition else 0,
+            rows=n // 2 if repetition == 2 else n,
+            suffix=b"\xa5" if n else b"",
+        )
+        detail = levels.header
+        if version == "v1":
+            fields = ((1, n), (2, 0), (3, 3), (4, 3))
+            kind = 0
+        else:
+            fields = (
+                (1, n),
+                (2, detail.num_nulls + int(malformed)),
+                (3, detail.num_rows),
+                (4, 0),
+                (5, detail.definition_levels_byte_length),
+                (6, detail.repetition_levels_byte_length),
+            )
+            kind = 3
+        payload = levels.payload
+        if malformed and version == "v1":
+            payload = b"\x02\x00\x00\x00\x00\x01\xa5"
+        header = PageHeaderAdmissionTests().wire(
+            kind,
+            detail=tuple((key, "i32", _grammar_integer(value)) for key, value in fields),
+            compressed=len(payload),
+            uncompressed=len(payload) + uncompressed_extra,
+        )
+        footer_api = FooterProfileTests()
+        segment = header + payload
+        rows = n // 2 if repetition == 2 else n
+        metadata = footer_api.meta(
+            values=n,
+            data=64,
+            compressed=len(segment),
+            uncompressed=len(segment) + uncompressed_extra,
+            encodings=(0, 3),
+            codec=codec,
+        )
+        footer = footer_api.payload(
+            (footer_api.root(1), footer_api.node(b"n", repetition=repetition)),
+            (
+                footer_api.group(
+                    (footer_api.chunk(metadata),), rows=rows, size=len(segment) + uncompressed_extra
+                ),
+            ),
+            rows=rows,
+        )
+        prefix = b"PAR1" + b"\x00" * 60 + segment
+        return SimpleNamespace(
+            payload=prefix + footer + len(footer).to_bytes(4, "little") + b"PAR1",
+            footer=footer,
+            footer_start=len(prefix),
+        )
+
+    def consume_owned_levels(self, owner, body):
+        try:
+            result = owner.consume_levels(body)
+        except PinnedReadRefused as error:
+            self.fail(f"admitted codec-0 data page refused level consumption: {error.reason_code}")
+        self.assertIsInstance(result, bounded_parquet._OwnedPageLevels)
+        return result
+
+    def assert_level_only_delta(self, env, before, *, work, levels):
+        after = self.counters(env)
+        self.assertEqual(after.read, before.read)
+        self.assertEqual(after.requests, before.requests)
+        self.assertEqual(after.closes, before.closes)
+        self.assertEqual(after.wire, before.wire)
+        self.assertEqual(
+            after.page,
+            before.page
+            | {
+                "work_units": before.page["work_units"] + work,
+                "levels": before.page["levels"] + levels,
+            },
+        )
+
+    def test_owned_level_consumption_binds_flat_pages_and_preserves_framing(self):
+        for version in ("v1", "v2"):
+            with (
+                self.subTest(version=version),
+                self.environment(case=self.level_case(version)) as env,
+            ):
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                result = self.consume_owned_levels(owner, body)
+                self.assertIs(result.body, body)
+                self.assertIs(owner.current_body, body)
+                self.assertEqual(result.receipt_after, body.receipt_after)
+                self.assertEqual(result.work_before, before.page["work_units"])
+                self.assertEqual(result.work_after, before.page["work_units"] + 5)
+                PageLevelScanTests().counts(result.summary, positions=8, non_nulls=8, rows=8)
+                self.assertEqual(result.summary.repetition_span, (0, 0))
+                self.assertEqual(result.summary.definition_span, (0, 0))
+                self.assertEqual(result.summary.values_span, (0, len(body.payload)))
+                self.assert_level_only_delta(env, before, work=5, levels=16)
+                self.assertFalse(hasattr(result, "__dict__"))
+                with self.assertRaises(FrozenInstanceError):
+                    result.work_after = 0
+                receipt = owner.finish(body)
+                self.assertEqual((receipt.page_count, receipt.data_positions), (1, 8))
+                self.assertEqual(receipt.status, "opaque_framing_provisional")
+                self.assertIs(receipt.whole_source_digest_verified, False)
+                self.assertFalse(env.profile.read_eligible)
+                self.assertFalse(body.header.admission.decode_eligible)
+
+    def test_owned_levels_allow_nonterminal_scan_and_successor_scan(self):
+        with self.environment() as env:
+            owner = self.start(env)
+            first = owner.current_body
+            first_result = self.consume_owned_levels(owner, first)
+            self.assert_invalid(env, lambda: owner.consume_levels(first))
+            second = owner.advance(first)
+            self.assert_invalid(env, lambda: owner.consume_levels(first))
+            before = self.counters(env)
+            second_result = self.consume_owned_levels(owner, second)
+            self.assertIs(second_result.body, second)
+            self.assertIsNot(first_result, second_result)
+            self.assert_level_only_delta(env, before, work=5, levels=2)
+            receipt = owner.finish(second)
+            self.assertEqual((receipt.page_count, receipt.data_positions), (2, 2))
+            self.assert_invalid(env, lambda: owner.consume_levels(second))
+
+    def test_owned_levels_scan_actual_nullable_and_repeated_level_streams(self):
+        for version, repetition, end, work, rows in (
+            ("v1", 1, 6, 36, 8),
+            ("v2", 1, 2, 32, 8),
+            ("v1", 2, 12, 44, 4),
+            ("v2", 2, 4, 36, 4),
+        ):
+            with (
+                self.subTest(version=version, repetition=repetition),
+                self.environment(case=self.level_case(version, repetition=repetition)) as env,
+            ):
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                result = self.consume_owned_levels(owner, body)
+                rep_end = end // 2 if repetition == 2 else 0
+                self.assertEqual(result.summary.repetition_span, (0, rep_end))
+                self.assertEqual(result.summary.definition_span, (rep_end, end))
+                self.assertEqual(result.summary.values_span, (end, end + 1))
+                PageLevelScanTests().counts(result.summary, non_nulls=4, rows=rows)
+                self.assert_level_only_delta(env, before, work=work, levels=16)
+                self.assertEqual(owner.finish(body).data_positions, 8)
+
+    def test_owned_levels_preserve_zero_position_stream_boundaries(self):
+        for version, repetition, end, work in (
+            ("v1", 0, 0, 5),
+            ("v2", 0, 0, 5),
+            ("v1", 1, 4, 9),
+            ("v2", 1, 0, 5),
+        ):
+            with (
+                self.subTest(version=version, repetition=repetition),
+                self.environment(case=self.level_case(version, repetition=repetition, n=0)) as env,
+            ):
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                result = self.consume_owned_levels(owner, body)
+                PageLevelScanTests().counts(
+                    result.summary, positions=0, non_nulls=0, rows=0, first=None
+                )
+                self.assertEqual(result.summary.definition_span, (0, end))
+                self.assertEqual(result.summary.values_span, (end, end))
+                self.assert_level_only_delta(env, before, work=work, levels=0)
+                self.assertEqual(owner.finish(body).data_positions, 0)
+
+    def test_owned_levels_reject_foreign_cloned_and_repeated_bodies_without_charge(self):
+        with self.environment() as env, self.environment() as foreign:
+            owner = self.start(env)
+            body = owner.current_body
+            foreign_body = self.start(foreign).current_body
+            for supplied in (object(), replace(body), foreign_body):
+                with self.subTest(body_type=type(supplied).__name__):
+                    self.assert_invalid(
+                        env, lambda supplied=supplied: owner.consume_levels(supplied)
+                    )
+            self.assert_invalid(env, lambda: type(owner).consume_levels(object(), body))
+            self.consume_owned_levels(owner, body)
+            self.assert_invalid(env, lambda: owner.consume_levels(body))
+            self.assertIs(owner.current_body, body)
+            second = owner.advance(body)
+            self.assertEqual(owner.finish(second).page_count, 2)
+
+    def test_owned_levels_unsupported_dictionary_and_codec_keep_framing_usable(self):
+        cases = (self.mixed_case(), self.level_case(codec=1))
+        for index, case in enumerate(cases):
+            with self.subTest(case=index), self.environment(case=case) as env:
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    owner.consume_levels(body)
+                self.assertEqual(caught.exception.reason_code, "unsupported_mode")
+                self.assertEqual(self.counters(env), before)
+                self.assertIs(owner.current_body, body)
+                if index == 0:
+                    body = owner.advance(body)
+                    body = owner.advance(body)
+                receipt = owner.finish(body)
+                self.assertEqual(receipt.status, "opaque_framing_provisional")
+
+    def test_owned_levels_reject_external_work_read_or_closed_source_before_admission(self):
+        for fault in ("work", "read", "closed", "scanner"):
+            with self.subTest(fault=fault), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                if fault == "work":
+                    env.ledgers.page.reserve(bounded_parquet._PageCharge(work_units=1))
+                elif fault == "read":
+                    env.io.module._read_pinned_range(env.source, offset=0, length=1)
+                elif fault == "scanner":
+                    section = bounded_parquet._PageLevelInput(
+                        body.payload, 0, len(body.payload), body.header.admission.detail, 0, 0
+                    )
+                    bounded_parquet._scan_page_levels(section, budget=env.ledgers.page)
+                else:
+                    env.source._closed = True
+                try:
+                    self.assert_invalid(
+                        env, lambda owner=owner, body=body: owner.consume_levels(body)
+                    )
+                    self.assertIs(owner.current_body, body)
+                finally:
+                    if fault == "closed":
+                        env.source._closed = False
+
+    def test_owned_levels_external_work_after_success_still_invalidates_transition(self):
+        with self.environment() as env:
+            owner = self.start(env)
+            body = owner.current_body
+            self.consume_owned_levels(owner, body)
+            env.ledgers.page.reserve(bounded_parquet._PageCharge(work_units=1))
+            self.assert_invalid(env, lambda: owner.advance(body))
+            self.assert_invalid(env, lambda: owner.consume_levels(body))
+
+    def test_owned_levels_malformed_wire_and_v2_counts_poison_without_refund(self):
+        for version, work, levels, reason in (
+            ("v1", 9, 16, "schema_mismatch"),
+            ("v2", 31, 16, "schema_mismatch"),
+        ):
+            with (
+                self.subTest(version=version),
+                self.environment(
+                    case=self.level_case(version, repetition=1, malformed=True)
+                ) as env,
+            ):
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+                    owner.consume_levels(body)
+                self.assertEqual(caught.exception.reason_code, reason)
+                self.assert_level_only_delta(env, before, work=work, levels=levels)
+                self.assert_poisoned(env, owner, body)
+                self.assert_invalid(env, lambda owner=owner, body=body: owner.consume_levels(body))
+
+    def test_owned_levels_budget_failures_preserve_charged_prefix_and_poison(self):
+        for allowance, spent, levels in ((0, 0, 0), (1, 1, 0), (2, 2, 2), (4, 4, 2)):
+            with self.subTest(allowance=allowance), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                env.ledgers.page.limits = replace(
+                    env.ledgers.page.limits,
+                    max_work_units=before.page["work_units"] + allowance,
+                )
+                with self.assertRaises(PinnedReadRefused) as caught:
+                    owner.consume_levels(body)
+                self.assertEqual(caught.exception.reason_code, "resource_limit")
+                self.assert_level_only_delta(env, before, work=spent, levels=levels)
+                self.assert_poisoned(env, owner, body)
+
+    def test_owned_levels_exact_budget_succeeds_and_one_below_levels_poison(self):
+        for available in (1, 2):
+            with self.subTest(levels=available), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                env.ledgers.page.limits = replace(
+                    env.ledgers.page.limits,
+                    max_work_units=before.page["work_units"] + 5,
+                    max_levels=before.page["levels"] + available,
+                )
+                if available == 1:
+                    with self.assertRaises(PinnedReadRefused) as caught:
+                        owner.consume_levels(body)
+                    self.assertEqual(caught.exception.reason_code, "resource_limit")
+                    self.assert_level_only_delta(env, before, work=1, levels=0)
+                    self.assert_poisoned(env, owner, body)
+                else:
+                    self.consume_owned_levels(owner, body)
+                    self.assert_level_only_delta(env, before, work=5, levels=2)
+
+    def test_owned_levels_deadline_failure_poison_preserves_actual_work_origin(self):
+        for spent in (0, 1, 4):
+            with self.subTest(spent=spent), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                original_clock = env.ledgers.read.clock_ns
+                target = before.page["work_units"] + spent
+
+                def deadline(clock=original_clock, budget=env.ledgers.page, target=target):
+                    stamp = clock()
+                    if budget.work_units == target:
+                        return budget.read_budget.limits.deadline_ns
+                    return stamp
+
+                env.ledgers.read.clock_ns = deadline
+                try:
+                    with self.assertRaises(PinnedReadRefused) as caught:
+                        owner.consume_levels(body)
+                    self.assertEqual(caught.exception.reason_code, "deadline_exceeded")
+                    self.assert_level_only_delta(
+                        env, before, work=spent, levels=2 if spent >= 2 else 0
+                    )
+                    self.assert_poisoned(env, owner, body)
+                finally:
+                    env.ledgers.read.clock_ns = original_clock
+
+    def test_owned_levels_final_liveness_and_receipt_check_prevent_publication(self):
+        for fault in ("closed", "read"):
+            with self.subTest(fault=fault), self.environment() as env:
+                owner = self.start(env)
+                body = owner.current_body
+                before = self.counters(env)
+                original_clock = env.ledgers.read.clock_ns
+                fired = []
+                target = before.page["work_units"] + 4
+
+                def invalidate(
+                    clock=original_clock, target=target, env=env, fired=fired, fault=fault
+                ):
+                    stamp = clock()
+                    if not fired and env.ledgers.page.work_units == target:
+                        fired.append(fault)
+                        if fault == "closed":
+                            env.source._closed = True
+                        else:
+                            env.io.module._read_pinned_range(env.source, offset=0, length=1)
+                    return stamp
+
+                env.ledgers.read.clock_ns = invalidate
+                try:
+                    with self.assertRaises(PinnedReadRefused) as caught:
+                        owner.consume_levels(body)
+                    self.assertEqual(caught.exception.reason_code, "invalid_contract")
+                    self.assertEqual(fired, [fault])
+                    self.assertEqual(env.ledgers.page.work_units, before.page["work_units"] + 5)
+                    self.assert_poisoned(env, owner, body)
+                finally:
+                    env.ledgers.read.clock_ns = original_clock
+                    env.source._closed = False
+
+    def test_owned_levels_uncompressed_size_mismatch_poison_before_scanner(self):
+        with self.environment(case=self.level_case(uncompressed_extra=1)) as env:
+            owner = self.start(env)
+            body = owner.current_body
+            before = self.counters(env)
+            with self.assertRaises(bounded_parquet._CompactWireMalformed) as caught:
+                owner.consume_levels(body)
+            self.assertEqual(caught.exception.reason_code, "schema_mismatch")
+            self.assert_level_only_delta(env, before, work=1, levels=0)
+            self.assert_poisoned(env, owner, body)
+
+    def test_owned_levels_reuse_scanner_with_exact_admitted_body_and_leaf(self):
+        with self.environment(case=self.level_case("v2", repetition=2)) as env:
+            owner = self.start(env)
+            body = owner.current_body
+            before = self.counters(env)
+            actual_scan = bounded_parquet._scan_page_levels
+            observed = []
+
+            def observe(section, *, budget):
+                summary = actual_scan(section, budget=budget)
+                observed.append((section, budget, summary))
+                return summary
+
+            with patch.object(bounded_parquet, "_scan_page_levels", side_effect=observe):
+                result = self.consume_owned_levels(owner, body)
+            self.assertEqual(len(observed), 1)
+            section, budget, summary = observed[0]
+            self.assertIs(section.payload, body.payload)
+            self.assertEqual((section.start, section.stop), (0, len(body.payload)))
+            self.assertIs(section.header, body.header.admission.detail)
+            self.assertEqual(section.max_definition_level, body.header.leaf.definition_depth)
+            self.assertEqual(section.max_repetition_level, body.header.leaf.repetition_depth)
+            self.assertIs(budget, env.ledgers.page)
+            self.assertIs(result.summary, summary)
+            self.assert_level_only_delta(env, before, work=36, levels=16)
+            self.assertEqual(owner.finish(body).data_positions, 8)
